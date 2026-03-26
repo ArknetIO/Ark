@@ -1,113 +1,409 @@
 # ArkLang: The AI-Native Compiler
 
+**Schemas-first systems language with zero-cost reflection and execution domains (`[host]` / `[gpu]`) that let AI and systems code live in one coherent model.**
 
-**schemas-first systems language with zero-cost reflection and execution domains ([host]/[gpu]) that make AI + systems code live in one coherent model.**
+## Key Features
 
-## 🚀 Key Features (v1.0)
+- **First-class AI primitives**
+  - `alloc<tensor[N]f32>` for native tensor allocation
+  - `par(i in 0..N)` for parallel map-style loops
 
-* **First-Class AI Primitives:**
-* **`alloc<tensor[N]f32>`**: Native tensor types that lower to ranked MLIR tensors.
-* **`par(i in 0..N)`**: Parallel map loops for high-throughput data processing.
+- **Asynchronous hazard management**
+  - `<-` launches work asynchronously and returns a token
+  - `await` makes synchronization explicit
+  - the compiler tracks RAW/WAW hazards and injects dependencies automatically
 
+- **MLIR-based backend**
+  - lowers Ark source into **Ark IR** (custom MLIR dialect)
+  - builds on LLVM’s optimization pipeline
 
-* **Asynchronous Hazard Management:**
-* **`<-` (Launch Operator)**: Dispatches kernels asynchronously, returning a **Token**.
-* **`await`**: Explicit synchronization points based on token dependencies.
-* **Automatic Hazard Tracking**: The compiler tracks write-after-write (WAW) and read-after-write (RAW) hazards and automatically injects dependencies into kernel launches.
-
-
-* **MLIR-Based Backend:**
-* Lowers Ark source code directly into the **Ark IR** (a custom MLIR Dialect).
-* Leverages LLVM's mature optimization pipeline.
-
-
-
-## 🛠️ Architecture
+## Architecture
 
 ArkLang is built on top of **LLVM 18/19** and **MLIR**.
 
-1. **Lexer/Parser**: Custom C++ frontend that builds an AST.
-2. **Ark Ops (TableGen)**: Defines the custom IR (`ark.launch`, `ark.alloc`, `ark.map`).
-3. **Code Generation**: Traverses the AST and emits MLIR SSA (Static Single Assignment) form.
-4. **Driver**: The `arkc` binary that orchestrates the pipeline.
+1. **Lexer / Parser**  
+   Custom C++ frontend that builds the AST.
 
-## 📦 Build Instructions
+2. **Ark Ops (TableGen)**  
+   Defines the custom IR, including operations such as `ark.launch`, `ark.alloc`, and `ark.map`.
 
-### Prerequisites
+3. **Code Generation**  
+   Traverses the AST and emits MLIR SSA form.
 
-* C++17 Compiler (GCC/Clang)
-* CMake 3.20+
-* LLVM/MLIR 18 or 19 (Built from source)
+4. **Driver**  
+   The `arkc` binary orchestrates the pipeline.
 
-### Building
+---
 
-```bash
-# 1. Create build directory
-mkdir build && cd build
+## Build From Source
 
-# 2. Configure (Point to your LLVM install)
-cmake -G Ninja .. \
-  -DMLIR_DIR=$HOME/llvm-install/lib/cmake/mlir \
-  -DLLVM_DIR=$HOME/llvm-install/lib/cmake/llvm
+These instructions build:
 
-# 3. Compile
-cmake --build . --target arkc
+- core libraries
+- compiler stack
+- `arkc`
 
+These instructions **do not** build backend services. Services require extra dependencies and are intentionally left off in the default fresh-install path.
+
+---
+
+## Version Requirements
+
+- **CMake 3.20+**
+- **LLVM + MLIR 18 or 19**
+- **C++20-capable compiler**
+- **Git**
+
+---
+
+## Windows (Fresh Install)
+
+### 1. Install prerequisites
+
+Install:
+
+- **Visual Studio 2022** with **Desktop development with C++**
+- **CMake**
+- **Git**
+
+Open:
+
+- **x64 Native Tools PowerShell for VS 2022**
+
+Install CMake and Git with `winget`:
+
+```powershell
+winget install Kitware.CMake
+winget install Git.Git
+````
+
+### 2. Install vcpkg and libsodium
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\dev\vcpkg
+cd C:\dev\vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg.exe install libsodium:x64-windows
 ```
 
-## 💻 Usage
+### 3. Build and install LLVM + MLIR
 
-The compiler reads `.ark` source files and outputs MLIR code.
+```powershell
+git clone https://github.com/llvm/llvm-project.git C:\dev\llvm-project
 
-```bash
-# Compile to MLIR (printed to stdout)
-./build/bin/arkc tests/monolith.ark -o -
+cmake -S C:\dev\llvm-project\llvm -B C:\dev\llvm-build `
+  -G "Visual Studio 17 2022" `
+  -A x64 `
+  -DLLVM_ENABLE_PROJECTS=mlir `
+  -DLLVM_TARGETS_TO_BUILD=Native `
+  -DLLVM_ENABLE_ASSERTIONS=ON `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_INSTALL_PREFIX=C:\dev\llvm-install
 
-# Compile to a file
-./build/bin/arkc input.ark -o output.mlir
-
+cmake --build C:\dev\llvm-build --config Release --target INSTALL -- /m
 ```
 
-## 📝 Example Code
+Verify:
 
-Here is the **Monolith Test** (`tests/monolith.ark`) which demonstrates the core capabilities:
+```powershell
+Test-Path C:\dev\llvm-install\lib\cmake\llvm\LLVMConfig.cmake
+Test-Path C:\dev\llvm-install\lib\cmake\mlir\MLIRConfig.cmake
+```
+
+Both commands must print `True`.
+
+### 4. Clone Ark
+
+```powershell
+git clone https://github.com/ArknetIO/Ark.git C:\dev\Ark
+cd C:\dev\Ark
+```
+
+### 5. Configure Ark
+
+```powershell
+Remove-Item -Recurse -Force .\build -ErrorAction Ignore
+
+cmake -S . -B build `
+  -G "Visual Studio 17 2022" `
+  -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:\dev\vcpkg\scripts\buildsystems\vcpkg.cmake `
+  -DARK_BUILD_TOOLS=ON `
+  -DARK_BUILD_SERVICES=OFF `
+  -DLLVM_DIR=C:\dev\llvm-install\lib\cmake\llvm `
+  -DMLIR_DIR=C:\dev\llvm-install\lib\cmake\mlir
+```
+
+### 6. Build Ark
+
+```powershell
+cmake --build build --config Release -- /m
+```
+
+### 7. Core libraries only
+
+```powershell
+Remove-Item -Recurse -Force .\build -ErrorAction Ignore
+
+cmake -S . -B build `
+  -G "Visual Studio 17 2022" `
+  -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:\dev\vcpkg\scripts\buildsystems\vcpkg.cmake `
+  -DARK_BUILD_TOOLS=OFF `
+  -DARK_BUILD_SERVICES=OFF
+
+cmake --build build --config Release -- /m
+```
+
+---
+
+## Linux (Fresh Install, Ubuntu/Debian)
+
+### 1. Install prerequisites
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  clang \
+  lld \
+  cmake \
+  ninja-build \
+  git \
+  python3 \
+  python3-pip \
+  pkg-config \
+  libsodium-dev \
+  zlib1g-dev
+```
+
+### 2. Build and install LLVM + MLIR
+
+```bash
+git clone https://github.com/llvm/llvm-project.git "$HOME/llvm-project"
+
+cmake -S "$HOME/llvm-project/llvm" -B "$HOME/llvm-build" -G Ninja \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_TARGETS_TO_BUILD="Native" \
+  -DLLVM_ENABLE_ASSERTIONS=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/llvm-install" \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DLLVM_ENABLE_LLD=ON
+
+cmake --build "$HOME/llvm-build" --parallel
+cmake --install "$HOME/llvm-build"
+```
+
+Verify:
+
+```bash
+test -f "$HOME/llvm-install/lib/cmake/llvm/LLVMConfig.cmake"
+test -f "$HOME/llvm-install/lib/cmake/mlir/MLIRConfig.cmake"
+```
+
+### 3. Clone Ark
+
+```bash
+git clone https://github.com/ArknetIO/Ark.git "$HOME/Ark"
+cd "$HOME/Ark"
+```
+
+### 4. Configure Ark
+
+```bash
+rm -rf build
+
+cmake -S . -B build -G Ninja \
+  -DARK_BUILD_TOOLS=ON \
+  -DARK_BUILD_SERVICES=OFF \
+  -DLLVM_DIR="$HOME/llvm-install/lib/cmake/llvm" \
+  -DMLIR_DIR="$HOME/llvm-install/lib/cmake/mlir"
+```
+
+### 5. Build Ark
+
+```bash
+cmake --build build --parallel
+```
+
+### 6. Core libraries only
+
+```bash
+rm -rf build
+
+cmake -S . -B build -G Ninja \
+  -DARK_BUILD_TOOLS=OFF \
+  -DARK_BUILD_SERVICES=OFF
+
+cmake --build build --parallel
+```
+
+---
+
+## macOS (Fresh Install)
+
+### 1. Install prerequisites
+
+Install Xcode Command Line Tools:
+
+```bash
+xcode-select --install
+```
+
+Install Homebrew if needed, then install dependencies:
+
+```bash
+brew install cmake ninja git pkg-config libsodium
+```
+
+### 2. Build and install LLVM + MLIR
+
+```bash
+git clone https://github.com/llvm/llvm-project.git "$HOME/llvm-project"
+
+cmake -S "$HOME/llvm-project/llvm" -B "$HOME/llvm-build" -G Ninja \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_TARGETS_TO_BUILD="Native" \
+  -DLLVM_ENABLE_ASSERTIONS=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/llvm-install"
+
+cmake --build "$HOME/llvm-build" --parallel
+cmake --install "$HOME/llvm-build"
+```
+
+Verify:
+
+```bash
+test -f "$HOME/llvm-install/lib/cmake/llvm/LLVMConfig.cmake"
+test -f "$HOME/llvm-install/lib/cmake/mlir/MLIRConfig.cmake"
+```
+
+### 3. Clone Ark
+
+```bash
+git clone https://github.com/ArknetIO/Ark.git "$HOME/Ark"
+cd "$HOME/Ark"
+```
+
+### 4. Configure Ark
+
+```bash
+rm -rf build
+
+cmake -S . -B build -G Ninja \
+  -DARK_BUILD_TOOLS=ON \
+  -DARK_BUILD_SERVICES=OFF \
+  -DLLVM_DIR="$HOME/llvm-install/lib/cmake/llvm" \
+  -DMLIR_DIR="$HOME/llvm-install/lib/cmake/mlir"
+```
+
+### 5. Build Ark
+
+```bash
+cmake --build build --parallel
+```
+
+### 6. Core libraries only
+
+```bash
+rm -rf build
+
+cmake -S . -B build -G Ninja \
+  -DARK_BUILD_TOOLS=OFF \
+  -DARK_BUILD_SERVICES=OFF
+
+cmake --build build --parallel
+```
+
+---
+
+## Usage
+
+Build output paths depend on generator and platform, but the compiler binary is `arkc`.
+
+Typical usage:
+
+```bash
+# print MLIR to stdout
+arkc tests/monolith.ark -o -
+
+# write MLIR to a file
+arkc input.ark -o output.mlir
+```
+
+---
+
+## Example
 
 ```ark
-// Define a GPU kernel
 fn[gpu] add_kernel(A: f32, B: f32) -> f32 {
     return A + B;
 }
 
 fn[host] main() -> i32 {
-    // 1. Native Tensor Allocation
     let A = alloc<f32[1024]> @gpu:0;
     let B = alloc<f32[1024]> @gpu:0;
     let C = alloc<f32[1024]> @gpu:0;
 
-    // 2. Async Kernel Launch
-    // "Launch add_kernel reading A, B and writing to C"
-    // Returns a token 't1' for synchronization.
     C <- add_kernel(A, B) as t1;
 
-    // 3. Synchronization
-    // Wait for the token before reading C on the host
     await t1;
 
-    // 4. Parallel Processing
     let res = par(i in 0..1024) {
-        i // Parallel map body
+        i
     };
 
     return 0;
 }
-
 ```
 
-## 🔮 Roadmap
+---
 
-* **Phase 1 (Complete):** Frontend & IR Definition.
-* **Phase 2:** Middle-End Optimization Passes (Parallel loop tiling, memory promotion).
-* **Phase 3:** Lowering to LLVM IR (Conversion to `gpu.launch` and `memref`).
-* **Phase 4:** Runtime Library (CUDA/Vulkan backend integration).
+## Common Failures
+
+### `MLIRConfig.cmake` not found
+
+Your LLVM install does not include MLIR, or `MLIR_DIR` is wrong.
+
+Required files:
+
+```text
+.../lib/cmake/llvm/LLVMConfig.cmake
+.../lib/cmake/mlir/MLIRConfig.cmake
+```
+
+### `unofficial-sodium` not found on Windows
+
+You configured without the vcpkg toolchain file or did not install `libsodium:x64-windows`.
+
+Use:
+
+```powershell
+-DCMAKE_TOOLCHAIN_FILE=C:\dev\vcpkg\scripts\buildsystems\vcpkg.cmake
+```
+
+### `cmake` is not recognized
+
+Install CMake, reopen your shell, and try again.
+
+### Services fail to configure
+
+The default source-build instructions disable services on purpose:
+
+```text
+-DARK_BUILD_SERVICES=OFF
+```
 
 ---
+
+## Roadmap
+
+* **Phase 1:** Frontend and IR definition
+* **Phase 2:** Middle-end optimization passes
+* **Phase 3:** Lowering to LLVM IR
+* **Phase 4:** Runtime library and backend integration
+
+[1]: https://mlir.llvm.org/getting_started/?utm_source=chatgpt.com "Getting Started - MLIR"
