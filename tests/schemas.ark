@@ -1,0 +1,151 @@
+// tests/schemas.ark
+
+// ==========================================
+// 1. Record Schema (Product Type)
+// ==========================================
+schema Point {
+    meta { 
+        desc: "2D Coordinate", 
+        packed: true 
+    }
+    x: i32,
+    y: i32
+}
+
+// ==========================================
+// 2. Enum Schemas (Sum Type / Unit Enum)
+// ==========================================
+schema Color {
+    Red,
+    Green,
+    Blue
+}
+
+schema Status {
+    Idle,
+    Running,
+    Error
+}
+
+// ==========================================
+// 3. Helper Functions (Test Type Persistence)
+// ==========================================
+
+fn[host] takes_color(x: Color) -> i32 {
+    print "  [Fn Param] x.name:", x.name;
+    return 0;
+}
+
+fn[host] echo_color(x: Color) -> Color {
+    return x;
+}
+
+// ==========================================
+// Main Execution
+// ==========================================
+fn[host] main() -> i32 {
+    print "=== SCHEMA INTEGRATION TEST ===";
+    print "";
+
+    // --------------------------------------
+    // Test A: Record (Struct) Logic
+    // --------------------------------------
+    print "[Test A] Struct Instantiation & Access";
+    
+    let p1 = Point { x: 10, y: 20 };
+    print "  Created Point p1 { x: 10, y: 20 }";
+    print "  p1.x (Expect 10):", p1.x;
+    print "  p1.y (Expect 20):", p1.y;
+
+    let sum = p1.x + p1.y;
+    print "  Sum of fields (Expect 30):", sum;
+    print "";
+
+    // --------------------------------------
+    // Test B: Enum Static & Reflection
+    // --------------------------------------
+    print "[Test B] Enum Static & Reflection";
+    
+    let c = Color.Green;
+    print "  Color.Green Tag (Expect 1):", c;
+    print "  c.name (Expect Green):", c.name;
+    print "";
+
+    // --------------------------------------
+    // Test C: Type Persistence (Advanced)
+    // --------------------------------------
+    print "[Test C] Type Persistence";
+
+    let c2 = c;
+    print "  [Copy] c2.name (Expect Green):", c2.name;
+
+    let c3: Color = c;
+    print "  [Explicit] c3.name (Expect Green):", c3.name;
+
+    print "  Calling takes_color(c)...";
+    takes_color(c);
+
+    print "  Calling echo_color(c)...";
+    let c4 = echo_color(c);
+    print "  [Return] c4.name (Expect Green):", c4.name;
+
+    // --------------------------------------
+    // Test D: Scope Shadowing
+    // --------------------------------------
+    print "";
+    print "[Test D] Scope Shadowing";
+    
+    let v = Color.Red;
+    print "  Outer v.name (Expect Red):", v.name;
+    {
+        let v = Status.Error;
+        print "  Inner v.name (Expect Error):", v.name;
+    }
+    print "  Outer v.name (Expect Red):", v.name;
+    
+    // --------------------------------------
+    // Test E: Control Flow Join
+    // --------------------------------------
+    print "";
+    print "[Test E] Control Flow Join";
+
+    let z = Color.Red;
+    
+    if (1 == 1) {
+        z = Color.Green;
+    } else {
+        z = Color.Blue;
+    }
+    
+    print "  [Join] z.name (Expect Green):", z.name;
+
+    // --------------------------------------
+    // Test F: Arrays (Container Types)
+    // --------------------------------------
+    print "";
+    print "[Test F] Arrays of Enums";
+    // Keeping this safe for now (immutable access works)
+    let arr = [Color.Red, Color.Green, Color.Blue];
+    print "  (Array test skipped for now)";
+
+    // --------------------------------------
+    // Test G: Complex Calls & Inference (NEW)
+    // --------------------------------------
+    print "";
+    print "[Test G] Complex Calls";
+
+    // 1. Pass MemberAccess (Color.Blue) directly as argument
+    // This tests the parser's ability to handle nested expressions in args
+    print "  Passing Color.Blue directly...";
+    takes_color(Color.Blue);
+
+    // 2. Infer type from Function Return
+    // This tests if 'ret' correctly picks up 'Color' type from 'echo_color'
+    print "  Let inference from call...";
+    let ret = echo_color(Color.Red);
+    print "  ret.name (Expect Red):", ret.name;
+    
+    print "";
+    print "=== TEST COMPLETE ===";
+    return 0;
+}

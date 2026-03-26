@@ -1,0 +1,12 @@
+fn[host] main() -> i32 !IO {
+    let n = 20000000;
+    let m = 1000000007;
+    let acc = 0;
+
+    for i in 0..n {
+        acc = (acc + i) % m;
+    }
+
+    print "ark checksum:", acc;
+    return 0;
+}

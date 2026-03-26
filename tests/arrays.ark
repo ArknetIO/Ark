@@ -1,0 +1,119 @@
+// tests/arrays.ark
+
+schema Point {
+    x: i32,
+    y: i32
+}
+
+schema Color {
+    Red,
+    Green,
+    Blue
+}
+
+fn[host] main() -> i32 {
+    print "=== CONTAINER SUITE (VECTORS & SLICES) ===";
+
+    // ---------------------------------------------------------
+    // Test 1: Integer Vectors (vec<i32>)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 1] Integer Vector Allocation";
+    let nums = [10, 20, 30, 40, 50];
+    
+    print "  Index 0 (Expect 10):", nums[0];
+    print "  Index 2 (Expect 30):", nums[2];
+    print "  Index 4 (Expect 50):", nums[4];
+
+    // Mutation Test
+    print "  [Mutation] Setting index 2 to 99...";
+    nums[2] = 99;
+    print "  Index 2 (Expect 99):", nums[2];
+
+
+    // ---------------------------------------------------------
+    // Test 2: Float Vectors (vec<f32>)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 2] Float Vector";
+    let floats = [1.5, 2.5, 3.5];
+    print "  Index 1 (Expect 2.5):", floats[1];
+
+
+    // ---------------------------------------------------------
+    // Test 3: Struct Vectors (vec<Point>) -> Testing Layout
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 3] Struct Vector (Memory Layout)";
+    
+    let p1 = Point { x: 1, y: 2 };
+    let p2 = Point { x: 3, y: 4 };
+    
+    // Rule A: This creates a contiguous buffer of Points
+    let points = [p1, p2];
+
+    print "  Access points[0].x (Expect 1):", points[0].x;
+    print "  Access points[1].y (Expect 4):", points[1].y;
+
+    // Mutation on Struct Element
+    print "  [Mutation] Setting points[0] to {x: 100, y: 200}";
+    points[0] = Point { x: 100, y: 200 };
+    print "  New points[0].x (Expect 100):", points[0].x;
+
+
+    // ---------------------------------------------------------
+    // Test 4: Enum Vectors (vec<Color>) -> Testing Tag Storage
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 4] Enum Vector (Tags)";
+    
+    let colors = [Color.Red, Color.Green, Color.Blue, Color.Red];
+
+    // Rule B + Reflection: The expression colors[1] has type 'Color'
+    print "  colors[1].name (Expect Green):", colors[1].name;
+    
+    if (colors[2] == Color.Blue) {
+        print "  Equality Check: colors[2] is Blue (PASS)";
+    } else {
+        print "  Equality Check: FAILED";
+    }
+
+    // ---------------------------------------------------------
+    // Test 5: Slices (Views)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 5] Slices (Views)";
+
+    // Slice from Integer Vector (nums is [10, 20, 99, 40, 50])
+    // Slice range 1..3 captures indices 1 and 2 -> [20, 99]
+    // 
+    let s_nums = nums[1..3];
+    
+    print "  Integer Slice [1..3] (Expect 20, 99):";
+    print "    s_nums[0]:", s_nums[0];
+    print "    s_nums[1]:", s_nums[1];
+
+    // CRITICAL: Proof of View Semantics (Aliasing)
+    // Mutating the ORIGINAL vector must update the SLICE
+    print "  [Aliasing] Mutating nums[1] to 888 (Should appear in s_nums[0])...";
+    nums[1] = 888;
+    print "    s_nums[0] (Expect 888):", s_nums[0];
+
+    // Slice from Enum Vector (colors is [Red, Green, Blue, Red])
+    // Slice range 2..4 captures indices 2 and 3 -> [Blue, Red]
+    let s_colors = colors[2..4];
+    
+    print "";
+    print "  Enum Slice [2..4] (Expect Blue, Red):";
+    print "    s_colors[0].name:", s_colors[0].name;
+    print "    s_colors[1].name:", s_colors[1].name;
+
+    // Implicit End Slice (v[2..])
+    // nums is [10, 888, 99, 40, 50] -> 2..end is [99, 40, 50]
+    let s_implicit = nums[2..];
+    print "  Implicit End Slice [2..] (Expect 99):", s_implicit[0];
+
+    print "";
+    print "=== SUCCESS ===";
+    return 0;
+}

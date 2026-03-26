@@ -1,0 +1,4 @@
+#pragma once
+#cmakedefine01 ARK_ENABLE_CUDA
+#cmakedefine01 ARK_ENABLE_HIP
+#cmakedefine01 ARK_ENABLE_METAL

@@ -1,0 +1,48 @@
+// tests/thorough.ark
+
+// Recursive function test
+fn[host] factorial(n: i32) -> i32 {
+    if (n < 2) { 
+        return 1; 
+    }
+    return n * factorial(n - 1);
+}
+
+fn[host] main() -> i32 {
+    print "==========================";
+    print " ARK COMPILER INTEGRATION ";
+    print "==========================";
+
+    // 1. Variable Binding & Arithmetic
+    print "[Test 1] Arithmetic";
+    let x = 10;
+    let y = 32;
+    let sum = x + y;
+    print "10 + 32 =", sum;
+
+    // 2. Control Flow (If/Else)
+    print "[Test 2] Logic Checks";
+    if (sum > 40) {
+        print "Success: 42 is greater than 40";
+    } else {
+        print "Failure: Logic error";
+    }
+
+
+    // 3. Loops (Range based)
+    print "[Test 3] Loop Iteration";
+    for (i in 1..4) {
+        print "Loop Iteration:", i;
+    }
+
+    // 4. Function Calls & Recursion
+    print "[Test 4] Recursion (Factorial)";
+    let f = factorial(5);
+    print "Factorial of 5 is:", f;
+
+    print "==========================";
+    print "   ALL SYSTEMS NOMINAL    ";
+    print "==========================";
+
+    return 0;
+}

@@ -1,0 +1,90 @@
+// tests/vec_full.ark
+
+fn[host] main() -> i32 {
+    print "=== VECTOR STRESS TEST ===";
+
+    // ---------------------------------------------------------
+    // 1. Expansion Test (Triggering Realloc)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 1] Expansion";
+    
+    // Start with a single element. Capacity is likely 1.
+    // Pushing more should force the runtime to resize the buffer.
+    let v = [100]; 
+    print "  Initial v[0]:", v[0];
+    print "  Initial len:", v.len;
+
+    print "  Pushing 200, 300, 400, 500...";
+    v.push(200); // Triggers realloc (cap 1 -> 2)
+    v.push(300); // Triggers realloc (cap 2 -> 4)
+    v.push(400); // No realloc
+    v.push(500); // Triggers realloc (cap 4 -> 8)
+
+    print "  New len:", v.len;
+    print "  v[4] (Expect 500):", v[4];
+
+    // ---------------------------------------------------------
+    // 2. Mutation Test (Setting)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 2] Setting / Mutation";
+    
+    print "  Setting v[2] (was 300) to 999...";
+    v[2] = 999;
+    
+    print "  v[2] is now:", v[2];
+
+    // ---------------------------------------------------------
+    // 3. Merging (Manual Append)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 3] Merging Vectors";
+    
+    let other = [600, 700];
+    print "  Merging [600, 700] into v...";
+
+    // Iterate 'other' and push to 'v'
+    for (i in 0..other.len) {
+        v.push(other[i]);
+    }
+
+    print "  Final len (Expect 7):", v.len;
+
+    // ---------------------------------------------------------
+    // 4. Full Readback
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 4] Full Dump";
+    
+    // Expected: 100, 200, 999, 400, 500, 600, 700
+    for (i in 0..v.len) {
+        print "  Index", i, ":", v[i];
+    }
+
+    // ---------------------------------------------------------
+    // 5. Iterator Summation (Data Integrity Check)
+    // ---------------------------------------------------------
+    // Ensures that sequential access works flawlessly after all
+    // mutations and reallocations.
+    print "";
+    print "[Test 5] Iterator Summation";
+    
+    let sum = 0;
+    // Iterate over the entire range to accumulate
+    for (k in 0..v.len) {
+        sum = sum + v[k];
+    }
+
+    // Calculation: 100 + 200 + 999 + 400 + 500 + 600 + 700 = 3499
+    print "  Sum (Expect 3499):", sum;
+
+    if (sum == 3499) {
+        print "  [SUCCESS] Integrity Verified.";
+    } else {
+        print "  [FAILURE] Data Corruption Detected.";
+        return 1;
+    }
+
+    return 0;
+}

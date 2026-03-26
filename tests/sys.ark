@@ -1,0 +1,19 @@
+fn[host] main() -> i32 !SYS !IO {
+    print "argc =", SYS.args.len;
+    print "argv0 =", SYS.args[0];
+
+    if (SYS.args.len > 1) {
+        for (i in 0..SYS.args.len) {
+            print "arg", i, " =", SYS.args[i];
+
+        }
+    }
+
+    let home = SYS.env.get("HOME");
+    if (home) {
+        print "HOME =", home.value;
+    }
+
+    print "cwd =", SYS.cwd();
+    return 0;
+}

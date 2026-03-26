@@ -1,0 +1,50 @@
+// syntax: fn name() -> return_type !CAP1 !CAP2 { ... }
+
+fn[host] main() -> i32 !FS !IO {
+    print "=== TEST: FILESYSTEM ===";
+    
+    let filename = "ark_fs_test.txt";
+    let content = "Arklang FS Check: OK---2";
+
+    // 1. Write Atomic
+    print "Writing:", filename;
+    FS.save(filename, content);
+
+    // 2. Read Back
+    print "Reading:", filename;
+    let data = FS.load(filename);
+    
+    print "Result content:";
+    print data;
+
+    return 0;
+}
+
+
+/*// syntax: fn name() -> return_type !CAP1 !CAP2 { ... }
+
+fn[host] main() -> i32 !FS {
+    print "=== TEST: FILESYSTEM ===";
+    
+    let filename = "ark_fs_test.txt";
+    let content = "Arklang FS Check: OK---2";
+
+    // 1. Write Atomic
+    print "Writing:", filename;
+    FS.save(filename, content);
+
+    // 2. Read Back
+    print "Reading:", filename;
+    let data = FS.load(filename);
+    print "Reading:", filename;
+    let (status, content, err) = FS.load(filename);
+
+    if (status == 0) {
+        print "Success! Content:";
+        print content;
+    } else {
+        print "Error code:", status;
+        print "Error msg:", err.msg;
+    }
+    return 0;
+}*/

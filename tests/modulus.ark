@@ -1,0 +1,8 @@
+fn[host] main() -> i32 !IO {
+    let x = 10;
+    let y = 3;
+    let temp = 91230;
+    let z = (temp % y) + x;
+    print "z:", z;
+    return 0;
+}

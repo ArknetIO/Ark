@@ -1,0 +1,25 @@
+import "math/vectors.ark" as v;
+
+
+// [FIX] Renamed 'host' -> 'addr' to avoid keyword collision
+fn[host] connect(addr: str, port: i32) -> i32 {
+    print "Address:", addr;
+    print "Port:", port;
+    print v.add(1,2);
+    return 0;
+}
+
+
+fn[host] main() -> i32 !IO {
+    print "=== TEST: NAMED ARGUMENTS ===";
+
+    let _port = 8080;
+    let _addr = "localhost";
+
+    
+    // Should reorder to (addr, port) in the backend
+    // [FIX] Using 'addr=' instead of 'host='
+    connect(port=_port, addr=_addr);
+    
+    return 0;
+}

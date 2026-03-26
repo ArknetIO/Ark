@@ -1,0 +1,67 @@
+// tests/unions.ark
+
+schema Event {
+    Click(i32, i32), // Tag 0
+    Key(i32),        // Tag 1
+    Quit             // Tag 2
+}
+
+
+
+fn[host] main() -> i32 {
+    print "=== TAGGED UNION FINAL VERIFICATION ===";
+    
+    let e1 = Event.Click(10, 20);
+
+    // ---------------------------------------------------------
+    // 1. Shadowing & Destructuring (The "Nasty Case")
+    // ---------------------------------------------------------
+    print "Test 1: Shadowing";
+    let x = 999;
+    match (e1) {
+        case Event.Click(x, y) => { 
+            print "  Inner x (Expect 10):", x; 
+        }
+        default => { print "  Error: Hit default"; }
+    }
+    print "  Outer x (Expect 999):", x;
+
+    // ---------------------------------------------------------
+    // 2. Ordering & Selection (The "Wrong Arm" Test)
+    // ---------------------------------------------------------
+    print "";
+    print "Test 2: Selection Logic";
+    
+    // We match on 'Click' (Tag 0), but list 'Key' (Tag 1) first.
+    // This proves the compiler ignores non-matching arms and jumps 
+    // to the correct tag, regardless of source order.
+    
+    match (e1) {
+        case Event.Key(k) => { 
+            print "  Error: Matched Key (Bad)"; 
+        }
+        case Event.Click(a, b) => { 
+            print "  Success: Matched Click! Sum (Expect 30):", a + b; 
+        }
+        default => { 
+            print "  Error: Hit default (Bad)"; 
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 3. Default Fallback Verification
+    // ---------------------------------------------------------
+    print "";
+    print "Test 3: Default Fallback";
+    let e_quit = Event.Quit;
+    
+    match (e_quit) {
+        case Event.Click(a, b) => { print "  Error: Click"; }
+        case Event.Key(k)      => { print "  Error: Key"; }
+        default                => { print "  Success: Hit Default (Correct)"; }
+    }
+
+    print "";
+    print "=== TEST COMPLETE ===";
+    return 0;
+}

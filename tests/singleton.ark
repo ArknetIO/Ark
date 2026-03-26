@@ -1,0 +1,53 @@
+// tests/singleton.ark
+
+// Define a Global Singleton with mixed types and defaults
+singleton schema Config {
+    port: i32 = 8080,
+    debug: bool = true,
+    scale: f64 = 1.5,
+    name: str = "ArkServer"
+}
+
+fn[host] main() -> i32 {
+    print "=== SINGLETON SCHEMA TEST ===";
+    
+    // 1. Verify Default Initialization
+    print "";
+    print "[Test 1] Default Values";
+    print "  Config.port (Expect 8080):", Config.port;
+    print "  Config.debug (Expect true):", Config.debug;
+    print "  Config.scale (Expect 1.5):", Config.scale;
+    print "  Config.name (Expect ArkServer):", Config.name;
+
+    if (Config.port != 8080) {
+        print "FAIL: Default port invalid";
+        return 1;
+    }
+
+    // 2. Verify Mutation & Persistence
+    print "";
+    print "[Test 2] Mutation";
+    print "  Mutating Config.port to 9090...";
+    Config.port = 9090;
+    
+    print "  Mutating Config.debug to false...";
+    Config.debug = false;
+
+    print "  New Config.port (Expect 9090):", Config.port;
+    print "  New Config.debug (Expect false):", Config.debug;
+
+    if (Config.port != 9090) {
+        print "FAIL: Port update failed";
+        return 2;
+    }
+    
+    // 3. Logic & Arithmetic
+    print "";
+    print "[Test 3] Float Arithmetic";
+    let doubled = Config.scale * 2.0;
+    print "  Config.scale * 2.0 (Expect 3.0):", doubled;
+    
+    print "";
+    print "=== SUCCESS ===";
+    return 0;
+}

@@ -1,0 +1,58 @@
+// tests/primitives.ark
+
+fn[host] main() -> i32 {
+    print "=== Testing New Primitives ===";
+
+    // 1. Boolean Type (i1)
+    let t: bool = true;
+    let f: bool = false;
+
+    print "Boolean True:", t;   // Should print 1 (or cast logic if implemented)
+    
+    if (t) {
+        print "Logic check: True branch works";
+    }
+    
+    if (f) {
+        print "Logic check: False branch FAILED";
+    } else {
+        print "Logic check: False branch works";
+    }
+
+    // 2. Floating Point 64-bit (f64)
+    let pi: f64 = 3.14159;
+    print "F64 Value:", pi;
+
+    // 3. Integer 64-bit (i64)
+    let bigNum: i64 = 9000000000;
+    print "I64 Value:", bigNum;
+
+    // 4. String Type (str)
+    let greeting: str = "Hello from Arklang!";
+    print "String Value:", greeting;
+
+    // 5. Type Inference Checks
+    // The compiler should now infer 'bool' from 'true' automatically
+    let inferredBool = true;
+    if (inferredBool) {
+        print "Inference: Bool inferred correctly";
+    }
+
+    // 6. Explicit Type Annotations
+    // These compile to ensure the parser/codegen handles the keywords correctly
+    let val8: i32 = 100;
+    let val32: i32 = 12345;
+    
+    print "Explicit I32:", val32;
+    
+    // 7. Math mixing
+    let x: f32 = 10.5;
+    let y: f32 = 2.5;
+    let result = x / y; // Should infer f32
+    print "F32 Division (10.5 / 2.5):", result;
+
+    let a: f64 = 16777217.0; // 2^24 + 1 (not exactly representable in f32)
+    print "F64 Exactness Check: ", a;
+
+    return 0;
+}

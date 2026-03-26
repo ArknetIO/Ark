@@ -1,0 +1,8 @@
+fn[host] main(argc: i32) -> i32 {
+    let x = 10;
+    let y = 20;
+    if (x + y == 30) {
+        return 0;
+    }
+    return -100;
+}

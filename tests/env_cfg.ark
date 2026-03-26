@@ -1,0 +1,83 @@
+// tests/env_cfg_runtime_target_string.ark
+// Env is a singleton: use Env.PORT / Env.DEBUG / Env.ARKNET_TOKEN directly.
+
+schema Env {
+    meta { format: env }
+    PORT: i32,
+    DEBUG: bool,
+    ARKNET_TOKEN: str
+}
+
+schema RuntimeCfg {
+    meta { format: toml, path: "Ark.toml", section: "runtime" }
+    timeout_ms: i32,
+    default_target: str,
+    arknet_endpoint: str,
+    arknet_max_burn_usd: f64
+}
+
+schema ExecCfg {
+    meta { format: toml, path: "Ark.toml", section: "exec" }
+    target: str,
+    max_burn_usd: f64,
+    timeout_ms: i32
+}
+
+fn[gpu] add_scalar_kernel(A: f64, offset: f64) -> f64 { return A + offset; }
+
+fn[host] main() -> i32 {
+    let rt: RuntimeCfg = RuntimeCfg;
+    let ex: ExecCfg = ExecCfg;
+
+    let port = Env.PORT or 8080;
+    let dbg  = Env.DEBUG ? Env.DEBUG : false;
+
+    let target  = ex.target or (rt.default_target or "localhost");
+    let timeout = (ex.timeout_ms or 0) != 0 ? ex.timeout_ms : ((rt.timeout_ms or 0) != 0 ? rt.timeout_ms : 5_000);
+    let burncap = (ex.max_burn_usd or 0.0) != 0.0 ? ex.max_burn_usd : ((rt.arknet_max_burn_usd or 0.0) != 0.0 ? rt.arknet_max_burn_usd : 1.0);
+
+    let endpoint = rt.arknet_endpoint or "https://runtimes.arknet.io";
+
+    let is_local =
+        target == "localhost" or
+        target == "cpu" or
+        target == "gpu:0" or
+        target == "gpu:1";
+
+    let token = Env.ARKNET_TOKEN or "";
+    if (!is_local) token = require(Env.ARKNET_TOKEN, "ARKNET_TOKEN missing");
+
+    if (port <= 0) return 10;
+    if (timeout <= 0) return 11;
+    if (burncap <= 0.0) return 12;
+    if (endpoint == "") return 13;
+    if (!is_local && token == "") return 14;
+
+    print "=== ENV/CFG TARGET STRING TEST ===";
+    print "PORT:", port, "DEBUG:", dbg;
+    print "target:", target, "timeout_ms:", timeout, "max_burn_usd:", burncap;
+    print "endpoint:", endpoint, "token_present:", token != "";
+
+    let preset = runtime{
+        target: target,
+        endpoint: endpoint,
+        token: token,
+        timeout_ms: timeout,
+        max_burn_usd: burncap
+    };
+
+    let size = 10;
+    let A = allocof<f64>(32);
+    for (i in 0..size) { A[i] = i; }
+
+    A <- add_scalar_kernel(A, 100.0) as t1 @runtime preset;
+    await t1;
+
+    let errors = 0;
+    for (k in 0..size) {
+        let expected = k + 100.0;
+        if (A[k] != expected) errors = errors + 1;
+    }
+
+    return errors == 0 ? 0 : 30;
+}

@@ -1,0 +1,91 @@
+fn[host] main() -> i32 {
+    print "smoke";
+    return 0;
+}
+
+/*// tests/trinity_smoke.ark
+// syntax: fn[host] main() -> i32 !FS !IO !NET { ... }
+
+fn[host] main() -> i32 !FS !IO !NET {
+    print "=== TRINITY SMOKE TEST (FS / IO / NET) ===";
+
+    // -------------------------
+    // FS: write / append / load
+    // -------------------------
+    print "\n[FS]";
+
+    let file = "ark_trinity_tmp.txt";
+    let a = "alpha\n";
+    let b = "beta\n";
+    let expect = "alpha\nbeta\n";
+
+    FS.write(file, a);
+    FS.append(file, b);
+
+    let got = FS.load(file);
+    if (got != expect) {
+        print "[FAIL][FS] mismatch";
+        return 1;
+    }
+    print "[OK][FS] write/append/load";
+
+    // -------------------------
+    // IO: pipe + writeAll + readExact (NO '&')
+    // Assumes:
+    //   IO.writeAll(fd, bytes) -> i64   (writes entire buffer or throws)
+    //   IO.readExact(fd, n) -> bytes    (reads exactly n or throws)
+    // If you don't have these overloads yet, add them as thin wrappers over the raw-pointer ABI.
+    // -------------------------
+    print "\n[IO]";
+
+    let (r, w) = IO.pipeX();
+    let msg = bytes("pipe_ok");      // bytes literal/ctor
+    let n = len(msg);
+
+    let wn = IO.writeAll(w, msg);
+    if (wn != n) {
+        print "[FAIL][IO] writeAll wrote", wn, "expected", n;
+        return 2;
+    }
+
+    let gotBytes = IO.readExact(r, n);
+    if (gotBytes != msg) {
+        print "[FAIL][IO] pipe payload mismatch";
+        return 3;
+    }
+
+    IO.close(r);
+    IO.close(w);
+    print "[OK][IO] pipeX/writeAll/readExact";
+
+    // -------------------------
+    // NET: loopback listen + accept + connect + send + recv
+    // -------------------------
+    print "\n[NET]";
+
+    let _host = "127.0.0.1";
+    let port = 39091;
+    let toMs = 2000;
+
+    let srv = NET.listen(_host, port);
+    let cli = NET.connect(_host, port, toMs);
+    let peer = NET.accept(srv);
+
+    let ping = bytes("ping");
+    NET.send(cli, ping);
+
+    let pkt = NET.recv(peer, 64);
+    if (pkt != ping) {
+        print "[FAIL][NET] payload mismatch";
+        return 4;
+    }
+
+    NET.close(cli);
+    NET.close(peer);
+    NET.close(srv);
+    print "[OK][NET] listen/accept/connect/send/recv/close";
+
+    print "\n[SUCCESS] Trinity verified.";
+    return 0;
+}
+*/

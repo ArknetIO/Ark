@@ -1,0 +1,14 @@
+// tests/math/vectors.ark
+
+schema Vector {
+    field: i32,
+    field64: i64
+}
+
+fn[host] add(x: i32, y: i32) -> i32 !IO {
+    return x + y;
+}
+
+fn[host] sub(x: i32, y: i32) -> i32 !IO {
+    return x - y;
+}

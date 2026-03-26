@@ -1,0 +1,18 @@
+// tests/main.ark
+
+// Implicit alias: stems "vectors" from filename
+import "math/vectors.ark" as v; 
+
+fn[host] main() -> i32 !IO {
+    print "Testing Modules...";
+
+    let temp = v.Vector { field: 12 };
+    
+    let sum = v.add(10, 20);
+    print "10 + 20 =", sum;
+    
+    let diff = v.sub(30, 5);
+    print "30 - 5 =", diff;
+
+    return 0;
+}

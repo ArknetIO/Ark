@@ -1,0 +1,93 @@
+// tests/lambda.ark
+
+fn[host] main() -> i32 {
+    print "=== LAMBDA & ANONYMOUS FUNCTION SUITE ===";
+
+    // ---------------------------------------------------------
+    // Test 1: Basic Arrow Syntax (Expression Body)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 1] Simple Arrow Function (Square)";
+    
+    // Defines a lambda taking i32 -> i32 with a single expression body
+    let square = (x: i32) -> i32 => x * x;
+
+    // Direct invocation of the variable
+    let res1 = square(5);
+    print "  square(5) Expect 25:", res1;
+
+    if (res1 == 25) {
+        print "  [PASS]";
+    } else {
+        print "  [FAIL]";
+    }
+
+    // ---------------------------------------------------------
+    // Test 2: Block Body Syntax
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 2] Block Body with Side Effects";
+
+    // Lambda with explicit block { ... } allows multiple statements
+    let verbose_add = (a: i32, b: i32) -> i32 => {
+        print "  [Inside Lambda] Adding inputs:", a, b;
+        let sum = a + b;
+        return sum;
+    };
+
+    let res2 = verbose_add(10, 20);
+    print "  Result Expect 30:", res2;
+
+    // ---------------------------------------------------------
+    // Test 3: Lambda as Higher-Order Logic (Simulated)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 3] Logic Encapsulation";
+
+    // Defining a "predicate" lambda
+    let is_even = (n: i32) -> bool => {
+        // Simple modulo logic using integer arithmetic
+        let rem = n / 2;
+        let check = rem * 2;
+        return check == n;
+    };
+
+    print "  is_even(4) Expect true (1):", is_even(4);
+    print "  is_even(7) Expect false (0):", is_even(7);
+
+    // ---------------------------------------------------------
+    // Test 4: Void Lambda (Action)
+    // ---------------------------------------------------------
+    print "";
+    print "[Test 4] Void / Action Lambda";
+
+    let greeter = (name: str) -> void => {
+        print "  Hello from Lambda,", name;
+    };
+
+    greeter("Ark User");
+
+    // Style A: Explicit Return Type (Strict)
+    // Useful for documentation or enforcing types (e.g. coercing i32 result to f64)
+    print "[Test 1] Explicit Syntax";
+    let explicit_sq = (x: i32) -> i32 => x * x;
+    print "  explicit_sq(5):", explicit_sq(5);
+
+    // Style B: Implicit Return Type (Concise)
+    // The compiler sees 'x * x' (i32 * i32) and infers -> i32
+    print "[Test 2] Implicit Syntax";
+    let implicit_sq = (x: i32) => x * x;
+    print "  implicit_sq(5):", implicit_sq(5);
+
+    // Style C: Implicit with Block (Infers Void usually, unless we add return scanning)
+    // Currently blocks default to Void return if not specified.
+    print "[Test 3] Void Action";
+    let logger = (msg: str) => {
+        print "  [LOG]", msg;
+    };
+    logger("System Online");
+
+    print "";
+    print "=== SUCCESS ===";
+    return 0;
+}

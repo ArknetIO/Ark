@@ -1,0 +1,31 @@
+// tests/generics.ark
+
+// 1. Define a Generic Schema
+schema Box<T> {
+    val: T
+}
+
+// 2. Define a Multi-Generic Schema
+schema Pair<A, B> {
+    first: A,
+    second: B
+}
+
+fn[host] main() -> i32 !IO {
+    print "--- Testing Generics ---";
+    let temp = 0.31923;
+    print "temp = ", temp;
+    // 3. Instantiate Box<i32>
+    let b1 = Box<i32> { val: 42 };
+    print "Box<i32> val =", b1.val;
+
+    // 4. Instantiate Box<f64>
+    let b2 = Box<f64> { val: 3.14159 };
+    print "Box<f64> val =", b2.val;
+
+    // 5. Instantiate Pair<i32, f64>
+    let p = Pair<i32, f64> { first: 10, second: 2.5 };
+    print "Pair:", p.first, p.second;
+
+    return 0;
+}

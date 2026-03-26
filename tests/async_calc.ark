@@ -1,0 +1,56 @@
+// tests/async_calc.ark
+
+// A simple kernel that adds a scalar 'offset' to every element of 'A'
+fn[cpu] add_scalar_kernel(A: f64, offset: f64) -> f64 {
+    return A + offset;
+}
+
+fn[host] main() -> i32 {
+    print "=== ASYNC KERNEL TEST ===";
+
+    // 1. Setup Data
+    let size = 10;
+    let A = allocof<f64>(32);
+
+    print "Allocated A address =", addr(A);
+
+    // Initialize A with 0..9
+    for (i in 0..size) {
+        A[i] = i; 
+    }
+
+    // 2. Launch Kernel
+    // We pass 'A' (buffer) and '100.0' (scalar).
+    // The compiler must correctly distinguish these!
+    print "Launching kernel...";
+    A <- add_scalar_kernel(A, 100.0) as t1;
+
+    // 3. Do some "work" on host while kernel runs
+    print "Host is doing other work...";
+
+    // 4. Synchronize
+    print "Waiting for kernel...";
+    await t1;
+
+    // 5. Verify Results
+    // Expected: 100, 101, 102...
+    let errors = 0;
+    for (k in 0..size) {
+        let expected = k + 100.0;
+        let val = A[k];
+        
+        // Simple float comparison
+        if (val != expected) {
+            print "Error at index", k, "- Expected:", expected, "Got:", val;
+            errors = errors + 1;
+        }
+    }
+
+    if (errors == 0) {
+        print "[SUCCESS] Kernel execution verified.";
+        return 0;
+    } else {
+        print "[FAILURE] Data mismatch.";
+        return 1;
+    }
+}

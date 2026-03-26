@@ -1,0 +1,10 @@
+[runtime]
+timeout_ms = 5000
+default_target = "localhost"
+arknet_endpoint = "https://runtimes.arknet.io"
+arknet_max_burn_usd = 1.0
+
+[exec]
+target = ""
+max_burn_usd = 0.0
+timeout_ms = 0

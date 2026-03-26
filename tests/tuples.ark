@@ -1,0 +1,20 @@
+// tests/tuple_test.ark
+
+// 1. Function returning a tuple
+fn[host] make_range(start: i32, end: i32) -> (i32, i32) !IO {
+    // Test Tuple Literal creation
+    return (start, end);
+}
+
+fn[host] main() -> i32 !IO {
+    // ---------------------------------------------------------
+    // Test 1: Function Return & Destructuring
+    // ---------------------------------------------------------
+    print(0); // Marker: Start
+    
+    let (start, end) = make_range(end=100, start=200);
+    
+    print "Start = ", start, " & end = ", end;
+
+    return 0;
+}

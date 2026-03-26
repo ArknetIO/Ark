@@ -1,0 +1,9 @@
+fn[host] main() -> i32 {
+    let text = "Arklang is Fast!";
+    
+    print "text is :", text;
+    print "Random Hash :", hash(text);
+    print "Stable Hash :", shash(text);
+    
+    return 0;
+}

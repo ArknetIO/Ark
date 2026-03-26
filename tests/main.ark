@@ -1,0 +1,99 @@
+// ==========================================
+// ArkLang Integration Test Suite
+// ==========================================
+
+// --- 1. Imports (Implicit Aliasing) ---
+
+// Core Language Features
+import "primitives.ark";
+import "arrays.ark";
+import "tuples.ark";
+// import "schemas.ark";
+import "unions.ark";
+import "generics.ark";
+import "lambda.ark";
+
+// Safety & Systems
+import "bounds.ark";
+import "capabilities.ark";
+
+// Advanced / Concurrency
+import "async_calc.ark";
+import "vec_full.ark";
+import "monolith.ark";
+
+// Smoke Tests
+import "hello.ark";
+import "trinity_smoke.ark";
+
+// --- 2. Test Runner Helper ---
+
+fn[host] check(name: str, res: i32) -> void !IO {
+    if (res == 0) {
+        print "  [PASS] " + name;
+    } else {
+        print "  [FAIL] " + name + " (Exit Code: ", res, ")";
+    }
+}
+
+// --- 3. Main Orchestrator ---
+
+fn[host] main() -> i32 !IO {
+    print "";
+    print "==========================================";
+    print "       ArkLang Test Runner v1.0";
+    print "==========================================";
+    print "";
+
+    // ------------------------------------------
+    // Group 1: Basics
+    // ------------------------------------------
+    print ">> Group 1: Core Language Features";
+    
+    check("Primitives", primitives.main());
+    check("Arrays",     arrays.main());
+    check("Tuples",     tuples.main());
+    // check("Schemas",    schemas.main());
+    check("Unions",     unions.main());
+    check("Generics",   generics.main());
+    check("Lambdas",    lambda.main());
+    
+    print "";
+
+    // ------------------------------------------
+    // Group 2: Safety Systems
+    // ------------------------------------------
+    print ">> Group 2: Safety & Bounds";
+
+    check("Bounds Check", bounds.main());
+    check("Capabilities", capabilities.main());
+
+    print "";
+
+    // ------------------------------------------
+    // Group 3: Advanced
+    // ------------------------------------------
+    print ">> Group 3: Advanced & Async";
+
+    check("Async Calc",   async_calc.main());
+    check("Vector Ops",   vec_full.main());
+    check("Monolith",     monolith.main());
+
+    print "";
+
+    // ------------------------------------------
+    // Group 4: Smoke Tests
+    // ------------------------------------------
+    print ">> Group 4: Smoke Tests";
+
+    check("Hello World",   hello.main(9999));
+    check("Trinity Smoke", trinity_smoke.main());
+
+    print "";
+    print "==========================================";
+    print "       All Tests Completed";
+    print "==========================================";
+    print "";
+
+    return 0;
+}
