@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,10 +18,18 @@
 namespace ark::cli {
 namespace {
 
+// -----------------------------------------------------------------------------
+// Diagnostics
+// -----------------------------------------------------------------------------
+
 [[noreturn]] void fatal(arklang::hud::Hud& hud, const std::string& msg) {
     hud.error(msg);
     std::exit(1);
 }
+
+// -----------------------------------------------------------------------------
+// Small String Helpers
+// -----------------------------------------------------------------------------
 
 std::string toString(llvm::StringRef s) {
     return std::string(s.data(), s.size());
@@ -33,6 +42,10 @@ llvm::StringRef toLlvmRef(std::string_view s) {
 void md5Sep(llvm::MD5& hash) {
     hash.update(llvm::StringRef("\0", 1));
 }
+
+// -----------------------------------------------------------------------------
+// Path Helpers
+// -----------------------------------------------------------------------------
 
 std::string normalizePath(std::string_view p) {
     llvm::SmallString<512> path(p);
@@ -101,6 +114,10 @@ bool entryIsDirectory(const llvm::sys::fs::directory_entry& entry) {
     return llvm::sys::fs::is_directory(*stOrErr);
 }
 
+// -----------------------------------------------------------------------------
+// Workspace Discovery
+// -----------------------------------------------------------------------------
+
 std::optional<std::string> findWorkspaceManifestUpwardsFrom(std::string_view startPath) {
     llvm::SmallString<512> dir(startPath);
 
@@ -140,6 +157,26 @@ std::optional<std::string> findWorkspaceManifestUpwards() {
     if (llvm::sys::fs::current_path(cwd)) return std::nullopt;
     return findWorkspaceManifestUpwardsFrom(toString(cwd.str()));
 }
+
+// -----------------------------------------------------------------------------
+// TOML Helpers
+// -----------------------------------------------------------------------------
+
+toml::table parseTomlOrFatal(const std::string& path, arklang::hud::Hud& hud) {
+    auto parsed = toml::parse_file(path);
+
+    if (!parsed) {
+        std::ostringstream oss;
+        oss << parsed.error();
+        fatal(hud, "Failed to parse " + path + ": " + oss.str());
+    }
+
+    return std::move(parsed).table();
+}
+
+// -----------------------------------------------------------------------------
+// MD5 Helpers
+// -----------------------------------------------------------------------------
 
 void md5UpdateTagged(llvm::MD5& hash, std::string_view key, std::string_view value) {
     hash.update(toLlvmRef(key));
@@ -191,6 +228,10 @@ void md5UpdateDirectoryArkSourcesIfPresent(llvm::MD5& hash, std::string_view tag
         md5UpdateFileContentsIfPresent(hash, std::string(tag) + ":file", f);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Workspace Resolution
+// -----------------------------------------------------------------------------
 
 std::string resolveForWorkspace(const WorkspaceConfig& config, std::string_view p) {
     llvm::StringRef ref = toLlvmRef(p);
@@ -315,56 +356,52 @@ WorkspaceConfig Workspace::discover(std::optional<std::string> explicitInput, ar
     config.rootDir = workspaceRoot;
     config.buildDir = joinPath(workspaceRoot, ".ark/build");
 
-    try {
-        toml::table tbl = toml::parse_file(manifestPath);
+    toml::table tbl = parseTomlOrFatal(manifestPath, hud);
 
-        if (auto* pkg = tbl.get_as<toml::table>("package")) {
-            if (auto* name = pkg->get_as<std::string>("name")) {
-                config.projectName = name->get();
-            }
+    if (auto* pkg = tbl.get_as<toml::table>("package")) {
+        if (auto* name = pkg->get_as<std::string>("name")) {
+            config.projectName = name->get();
         }
+    }
 
-        if (auto* build = tbl.get_as<toml::table>("build")) {
-            if (auto* entry = build->get_as<std::string>("entry")) {
-                config.entryFile = entry->get();
-            }
-            if (auto* target = build->get_as<std::string>("target")) {
-                config.profile.targetTriple = target->get();
-            }
-            if (auto* outDir = build->get_as<std::string>("build_dir")) {
-                config.buildDir = resolveForWorkspace(config, outDir->get());
-            }
+    if (auto* build = tbl.get_as<toml::table>("build")) {
+        if (auto* entry = build->get_as<std::string>("entry")) {
+            config.entryFile = entry->get();
         }
+        if (auto* target = build->get_as<std::string>("target")) {
+            config.profile.targetTriple = target->get();
+        }
+        if (auto* outDir = build->get_as<std::string>("build_dir")) {
+            config.buildDir = resolveForWorkspace(config, outDir->get());
+        }
+    }
 
-        if (auto* deps = tbl.get_as<toml::table>("dependencies")) {
-            config.dependencies.reserve(deps->size());
+    if (auto* deps = tbl.get_as<toml::table>("dependencies")) {
+        config.dependencies.reserve(deps->size());
 
-            for (auto&& [key, val] : *deps) {
-                Dependency d;
-                d.name = std::string(key.str());
+        for (auto&& [key, val] : *deps) {
+            Dependency d;
+            d.name = std::string(key.str());
 
-                if (val.is_string()) {
-                    d.version = val.as_string()->get();
-                } else if (val.is_table()) {
-                    auto& dtbl = *val.as_table();
+            if (val.is_string()) {
+                d.version = val.as_string()->get();
+            } else if (val.is_table()) {
+                auto& dtbl = *val.as_table();
 
-                    d.version = dtbl["version"].value<std::string>().value_or("");
+                d.version = dtbl["version"].value<std::string>().value_or("");
 
-                    if (auto p = dtbl["path"].value<std::string>()) d.localPath = *p;
-                    if (auto g = dtbl["git"].value<std::string>()) d.gitUrl = *g;
+                if (auto p = dtbl["path"].value<std::string>()) d.localPath = *p;
+                if (auto g = dtbl["git"].value<std::string>()) d.gitUrl = *g;
 
-                    if (d.localPath && d.gitUrl) {
-                        fatal(hud, "Dependency '" + d.name + "' cannot specify both 'path' and 'git'.");
-                    }
-                } else {
-                    fatal(hud, "Dependency '" + d.name + "' must be a string or table.");
+                if (d.localPath && d.gitUrl) {
+                    fatal(hud, "Dependency '" + d.name + "' cannot specify both 'path' and 'git'.");
                 }
-
-                config.dependencies.push_back(std::move(d));
+            } else {
+                fatal(hud, "Dependency '" + d.name + "' must be a string or table.");
             }
+
+            config.dependencies.push_back(std::move(d));
         }
-    } catch (const toml::parse_error& err) {
-        fatal(hud, "Failed to parse " + manifestPath + ": " + std::string(err.description()));
     }
 
     if (config.entryFile.empty()) config.entryFile = "src/main.ark";

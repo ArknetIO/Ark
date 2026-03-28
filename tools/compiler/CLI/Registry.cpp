@@ -10,17 +10,22 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <toml++/toml.hpp>
-#include <sstream>
+
 #include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace ark::cli {
 namespace {
 
+// -----------------------------------------------------------------------------
+// Diagnostics
+// -----------------------------------------------------------------------------
 [[noreturn]] void fail(const std::string& msg) {
     llvm::errs() << "[ERROR] " << msg << "\n";
     std::exit(1);
@@ -34,6 +39,9 @@ void note(const std::string& msg) {
     llvm::outs() << msg << "\n";
 }
 
+// -----------------------------------------------------------------------------
+// Path helpers
+// -----------------------------------------------------------------------------
 std::string toString(llvm::StringRef s) {
     return std::string(s.data(), s.size());
 }
@@ -53,7 +61,10 @@ std::string makeAbsolutePath(std::string_view p) {
 
     if (path.empty()) {
         llvm::SmallString<512> cwd;
-        if (llvm::sys::fs::current_path(cwd)) return ".";
+        if (llvm::sys::fs::current_path(cwd)) {
+            return ".";
+        }
+
         llvm::sys::path::remove_dots(cwd, true);
         return toString(cwd.str());
     }
@@ -76,8 +87,10 @@ std::string joinPath(std::string_view a, std::string_view b) {
 std::string parentDirOf(std::string_view p) {
     llvm::SmallString<512> path(p);
     llvm::sys::path::remove_dots(path, true);
-    llvm::StringRef parent = llvm::sys::path::parent_path(path);
-    if (parent.empty()) return ".";
+    const llvm::StringRef parent = llvm::sys::path::parent_path(path);
+    if (parent.empty()) {
+        return ".";
+    }
     return toString(parent);
 }
 
@@ -87,39 +100,60 @@ bool pathExists(std::string_view p) {
 
 bool isRegularFile(std::string_view p) {
     llvm::sys::fs::file_status st;
-    if (llvm::sys::fs::status(toLlvmRef(p), st)) return false;
+    if (llvm::sys::fs::status(toLlvmRef(p), st)) {
+        return false;
+    }
     return llvm::sys::fs::is_regular_file(st);
 }
 
 bool isDirectory(std::string_view p) {
     llvm::sys::fs::file_status st;
-    if (llvm::sys::fs::status(toLlvmRef(p), st)) return false;
+    if (llvm::sys::fs::status(toLlvmRef(p), st)) {
+        return false;
+    }
     return llvm::sys::fs::is_directory(st);
 }
 
 void createDirOrFail(std::string_view p) {
-    std::error_code ec = llvm::sys::fs::create_directories(toLlvmRef(p));
-    if (ec) fail("Failed to create directory '" + std::string(p) + "': " + ec.message());
+    const std::error_code ec = llvm::sys::fs::create_directories(toLlvmRef(p));
+    if (ec) {
+        fail("Failed to create directory '" + std::string(p) + "': " + ec.message());
+    }
 }
 
 void writeTextFileOrFail(std::string_view path, llvm::StringRef content) {
     std::error_code ec;
     llvm::raw_fd_ostream os(toLlvmRef(path), ec, llvm::sys::fs::OF_Text);
-    if (ec) fail("Failed to write file '" + std::string(path) + "': " + ec.message());
+    if (ec) {
+        fail("Failed to write file '" + std::string(path) + "': " + ec.message());
+    }
+
     os << content;
     os.flush();
+
+    if (os.has_error()) {
+        os.clear_error();
+        fail("Failed to write file '" + std::string(path) + "'");
+    }
 }
 
+// -----------------------------------------------------------------------------
+// Manifest discovery
+// -----------------------------------------------------------------------------
 std::optional<std::string> findManifestUpwardsFrom(std::string_view startPath) {
     llvm::SmallString<512> dir(startPath);
 
     if (dir.empty()) {
-        if (llvm::sys::fs::current_path(dir)) return std::nullopt;
+        if (llvm::sys::fs::current_path(dir)) {
+            return std::nullopt;
+        }
     }
 
     if (!isDirectory(toString(dir))) {
-        llvm::StringRef parent = llvm::sys::path::parent_path(dir);
-        if (parent.empty()) return std::nullopt;
+        const llvm::StringRef parent = llvm::sys::path::parent_path(dir);
+        if (parent.empty()) {
+            return std::nullopt;
+        }
         dir = llvm::SmallString<512>(parent);
     }
 
@@ -129,13 +163,20 @@ std::optional<std::string> findManifestUpwardsFrom(std::string_view startPath) {
         llvm::SmallString<512> manifest = dir;
         llvm::sys::path::append(manifest, "ark.toml");
 
-        if (llvm::sys::fs::exists(manifest)) return toString(manifest.str());
+        if (llvm::sys::fs::exists(manifest)) {
+            return toString(manifest.str());
+        }
 
-        llvm::StringRef parentRef = llvm::sys::path::parent_path(dir);
-        if (parentRef.empty() || parentRef == dir.str()) break;
+        const llvm::StringRef parentRef = llvm::sys::path::parent_path(dir);
+        if (parentRef.empty() || parentRef == dir.str()) {
+            break;
+        }
 
         llvm::SmallString<512> parent(parentRef);
-        if (parent == dir) break;
+        if (parent == dir) {
+            break;
+        }
+
         dir = parent;
     }
 
@@ -144,48 +185,73 @@ std::optional<std::string> findManifestUpwardsFrom(std::string_view startPath) {
 
 std::string requireWorkspaceManifest() {
     llvm::SmallString<512> cwd;
-    if (llvm::sys::fs::current_path(cwd)) fail("Failed to determine current directory.");
+    if (llvm::sys::fs::current_path(cwd)) {
+        fail("Failed to determine current directory.");
+    }
 
     const auto manifest = findManifestUpwardsFrom(toString(cwd.str()));
-    if (!manifest) fail("ark.toml not found in current directory or any parent directory.");
+    if (!manifest) {
+        fail("ark.toml not found in current directory or any parent directory.");
+    }
+
     return *manifest;
 }
 
-int runProgram(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args, std::string* errOut = nullptr) {
+// -----------------------------------------------------------------------------
+// Process helpers
+// -----------------------------------------------------------------------------
+int runProgram(
+    llvm::StringRef program,
+    llvm::ArrayRef<llvm::StringRef> args,
+    std::string* errOut = nullptr
+) {
     std::string errMsg;
-    std::optional<llvm::StringRef> redirects[] = {std::nullopt, std::nullopt, std::nullopt};
+    std::optional<llvm::StringRef> redirects[] = {
+        std::nullopt,
+        std::nullopt,
+        std::nullopt
+    };
 
-    int rc = llvm::sys::ExecuteAndWait(
+    const int rc = llvm::sys::ExecuteAndWait(
         program,
         args,
         std::nullopt,
         redirects,
         0,
         0,
-        &errMsg);
+        &errMsg
+    );
 
-    if (errOut) *errOut = std::move(errMsg);
+    if (errOut) {
+        *errOut = std::move(errMsg);
+    }
+
     return rc;
 }
 
 int runGit(const std::vector<std::string>& argsOwned) {
-    auto git = llvm::sys::findProgramByName("git");
-    if (!git) fail("'git' executable not found in PATH.");
+    const auto git = llvm::sys::findProgramByName("git");
+    if (!git) {
+        fail("'git' executable not found in PATH.");
+    }
 
     llvm::SmallVector<llvm::StringRef, 16> argv;
     argv.push_back(*git);
-    for (const auto& s : argsOwned) argv.push_back(s);
+    for (const auto& s : argsOwned) {
+        argv.push_back(s);
+    }
 
     std::string errMsg;
-    int rc = runProgram(*git, argv, &errMsg);
+    const int rc = runProgram(*git, argv, &errMsg);
     if (rc != 0 && !errMsg.empty()) {
         llvm::errs() << "[git] " << errMsg << "\n";
     }
+
     return rc;
 }
 
 void tryRunArknetFetch() {
-    auto arknet = llvm::sys::findProgramByName("arknet");
+    const auto arknet = llvm::sys::findProgramByName("arknet");
     if (!arknet) {
         warn("'arknet' not found in PATH. Run `arknet fetch` manually.");
         return;
@@ -196,13 +262,66 @@ void tryRunArknetFetch() {
     argv.push_back("fetch");
 
     std::string errMsg;
-    int rc = runProgram(*arknet, argv, &errMsg);
+    const int rc = runProgram(*arknet, argv, &errMsg);
     if (rc != 0) {
         warn("Automatic `arknet fetch` failed.");
-        if (!errMsg.empty()) llvm::outs() << "[WARN] " << errMsg << "\n";
+        if (!errMsg.empty()) {
+            llvm::outs() << "[WARN] " << errMsg << "\n";
+        }
     }
 }
 
+// -----------------------------------------------------------------------------
+// TOML helpers
+// -----------------------------------------------------------------------------
+toml::table loadTomlOrFail(const std::string& path) {
+    auto parsed = toml::parse_file(path);
+
+    if (!parsed) {
+        std::ostringstream oss;
+        oss << parsed.error();
+        fail("Failed to parse " + path + ": " + oss.str());
+    }
+
+    return std::move(parsed).table();
+}
+
+void writeTextFileAtomicOrFail(const std::string& path, const std::string& content) {
+    const std::string tmpPath = path + ".tmp";
+
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream os(tmpPath, ec, llvm::sys::fs::OF_Text);
+        if (ec) {
+            fail("Failed to open temp file '" + tmpPath + "': " + ec.message());
+        }
+
+        os << content;
+        os.flush();
+
+        if (os.has_error()) {
+            os.clear_error();
+            llvm::sys::fs::remove(tmpPath);
+            fail("Failed to write temp file '" + tmpPath + "'");
+        }
+    }
+
+    const std::error_code ec = llvm::sys::fs::rename(tmpPath, path);
+    if (ec) {
+        llvm::sys::fs::remove(tmpPath);
+        fail("Failed to replace '" + path + "' with temp file: " + ec.message());
+    }
+}
+
+void saveTomlOrFail(const std::string& path, const toml::table& tbl) {
+    std::ostringstream oss;
+    oss << tbl;
+    writeTextFileAtomicOrFail(path, oss.str());
+}
+
+// -----------------------------------------------------------------------------
+// Workspace resolution
+// -----------------------------------------------------------------------------
 struct ResolvedWorkspace {
     std::string manifestPath;
     std::string rootDir;
@@ -220,38 +339,6 @@ ResolvedWorkspace resolveWorkspace() {
 std::string depTargetDir(const ResolvedWorkspace& ws, const std::string& pkgName) {
     return joinPath(ws.depsDir, pkgName);
 }
-
-static void writeTextFileAtomicOrFail(const std::string& path, const std::string& content) {
-    const std::string tmpPath = path + ".tmp";
-
-    {
-        std::error_code ec;
-        llvm::raw_fd_ostream os(tmpPath, ec, llvm::sys::fs::OF_Text);
-        if (ec) fail("Failed to open temp file '" + tmpPath + "': " + ec.message());
-
-        os << content;
-        os.flush();
-
-        if (os.has_error()) {
-            os.clear_error();
-            llvm::sys::fs::remove(tmpPath);
-            fail("Failed to write temp file '" + tmpPath + "'");
-        }
-    }
-
-    std::error_code ec = llvm::sys::fs::rename(tmpPath, path);
-    if (ec) {
-        llvm::sys::fs::remove(tmpPath);
-        fail("Failed to replace '" + path + "' with temp file: " + ec.message());
-    }
-}
-
-static void saveTomlOrFail(const std::string& path, const toml::table& tbl) {
-    std::ostringstream oss;
-    oss << tbl;
-    writeTextFileAtomicOrFail(path, oss.str());
-}
-
 
 } // namespace
 
@@ -274,48 +361,51 @@ void setupAddCmd(CLI::App& app) {
     sub->add_flag("--no-fetch", *noFetch, "Do not run `arknet fetch` after updating manifest");
 
     sub->callback([pkgName, gitUrl, pathDep, version, noFetch]() {
-        if (pkgName->empty()) fail("Package name cannot be empty.");
+        if (pkgName->empty()) {
+            fail("Package name cannot be empty.");
+        }
 
         if (!gitUrl->empty() && !pathDep->empty()) {
             fail("Use only one source: --git or --path.");
         }
 
         const ResolvedWorkspace ws = resolveWorkspace();
+        toml::table tbl = loadTomlOrFail(ws.manifestPath);
 
-        try {
-            toml::table tbl = toml::parse_file(ws.manifestPath);
+        if (!tbl.contains("dependencies")) {
+            tbl.insert("dependencies", toml::table{});
+        }
 
-            if (!tbl.contains("dependencies")) {
-                tbl.insert("dependencies", toml::table{});
+        auto* deps = tbl.get_as<toml::table>("dependencies");
+        if (!deps) {
+            fail("`dependencies` exists in ark.toml but is not a table.");
+        }
+
+        if (!gitUrl->empty()) {
+            toml::table depEntry;
+            depEntry.insert("git", *gitUrl);
+            if (!version->empty()) {
+                depEntry.insert("version", *version);
             }
-
-            auto* deps = tbl.get_as<toml::table>("dependencies");
-            if (!deps) fail("`dependencies` exists in ark.toml but is not a table.");
-
-            if (!gitUrl->empty()) {
-                toml::table depEntry;
-                depEntry.insert("git", *gitUrl);
-                if (!version->empty()) depEntry.insert("version", *version);
-                deps->insert_or_assign(*pkgName, depEntry);
-            } else if (!pathDep->empty()) {
-                toml::table depEntry;
-                depEntry.insert("path", *pathDep);
-                if (!version->empty()) depEntry.insert("version", *version);
-                deps->insert_or_assign(*pkgName, depEntry);
-            } else {
-                deps->insert_or_assign(*pkgName, version->empty() ? "*" : *version);
+            deps->insert_or_assign(*pkgName, depEntry);
+        } else if (!pathDep->empty()) {
+            toml::table depEntry;
+            depEntry.insert("path", *pathDep);
+            if (!version->empty()) {
+                depEntry.insert("version", *version);
             }
+            deps->insert_or_assign(*pkgName, depEntry);
+        } else {
+            deps->insert_or_assign(*pkgName, version->empty() ? "*" : *version);
+        }
 
-            saveTomlOrFail(ws.manifestPath, tbl);
+        saveTomlOrFail(ws.manifestPath, tbl);
 
-            llvm::outs() << "Added `" << *pkgName << "` to " << ws.manifestPath << "\n";
+        llvm::outs() << "Added `" << *pkgName << "` to " << ws.manifestPath << "\n";
 
-            if (!*noFetch) {
-                llvm::outs() << "Fetching dependencies...\n";
-                tryRunArknetFetch();
-            }
-        } catch (const toml::parse_error& err) {
-            fail("Failed to parse " + ws.manifestPath + ": " + std::string(err.description()));
+        if (!*noFetch) {
+            llvm::outs() << "Fetching dependencies...\n";
+            tryRunArknetFetch();
         }
     });
 }
@@ -330,86 +420,86 @@ void setupFetchCmd(CLI::App& app) {
         const ResolvedWorkspace ws = resolveWorkspace();
         createDirOrFail(ws.depsDir);
 
-        try {
-            toml::table tbl = toml::parse_file(ws.manifestPath);
-            auto* deps = tbl.get_as<toml::table>("dependencies");
+        toml::table tbl = loadTomlOrFail(ws.manifestPath);
+        auto* deps = tbl.get_as<toml::table>("dependencies");
 
-            if (!deps || deps->empty()) {
-                llvm::outs() << "No dependencies to fetch.\n";
-                return;
-            }
-
-            for (auto&& [key, val] : *deps) {
-                const std::string pkg = std::string(key.str());
-                const std::string targetDir = depTargetDir(ws, pkg);
-
-                if (val.is_string()) {
-                    const std::string version = val.value<std::string>().value_or("*");
-                    warn("Registry dependency `" + pkg + "` (" + version + ") is not implemented yet. Use `--git` or `--path`.");
-                    continue;
-                }
-
-                if (!val.is_table()) {
-                    warn("Skipping dependency `" + pkg + "`: expected string or table.");
-                    continue;
-                }
-
-                auto& dtbl = *val.as_table();
-
-                if (auto local = dtbl["path"].value<std::string>()) {
-                    std::string resolvedLocal = *local;
-                    if (!llvm::sys::path::is_absolute(toLlvmRef(resolvedLocal))) {
-                        resolvedLocal = joinPath(ws.rootDir, resolvedLocal);
-                    }
-
-                    if (!pathExists(resolvedLocal) || !isDirectory(resolvedLocal)) {
-                        warn("Local dependency `" + pkg + "` path does not exist: " + resolvedLocal);
-                        continue;
-                    }
-
-                    llvm::outs() << "[LINK] " << pkg << " -> " << resolvedLocal << "\n";
-                    continue;
-                }
-
-                if (auto gitUrl = dtbl["git"].value<std::string>()) {
-                    if (pathExists(targetDir)) {
-                        llvm::outs() << "[OK] " << pkg << " already fetched at " << targetDir << "\n";
-                        continue;
-                    }
-
-                    llvm::outs() << "[FETCH] Cloning " << pkg << " from " << *gitUrl << "...\n";
-
-                    std::vector<std::string> args;
-                    args.emplace_back("clone");
-                    args.emplace_back("--depth");
-                    args.emplace_back("1");
-
-                    if (auto ver = dtbl["version"].value<std::string>(); ver && !ver->empty()) {
-                        args.emplace_back("--branch");
-                        args.emplace_back(*ver);
-                    }
-
-                    args.emplace_back(*gitUrl);
-                    args.emplace_back(targetDir);
-
-                    if (runGit(args) != 0) {
-                        warn("Failed to fetch `" + pkg + "`.");
-                        std::error_code ec;
-                        llvm::sys::fs::remove_directories(targetDir, /*IgnoreErrors=*/true);
-                        (void)ec;
-                        continue;
-                    }
-
-                    continue;
-                }
-
-                warn("Skipping dependency `" + pkg + "`: table must include `git` or `path`.");
-            }
-
-            llvm::outs() << "Fetch complete.\n";
-        } catch (const toml::parse_error& err) {
-            fail("Failed to parse " + ws.manifestPath + ": " + std::string(err.description()));
+        if (!deps || deps->empty()) {
+            llvm::outs() << "No dependencies to fetch.\n";
+            return;
         }
+
+        for (auto&& [key, val] : *deps) {
+            const std::string pkg = std::string(key.str());
+            const std::string targetDir = depTargetDir(ws, pkg);
+
+            if (val.is_string()) {
+                const std::string version = val.value<std::string>().value_or("*");
+                warn(
+                    "Registry dependency `" + pkg + "` (" + version +
+                    ") is not implemented yet. Use `--git` or `--path`."
+                );
+                continue;
+            }
+
+            if (!val.is_table()) {
+                warn("Skipping dependency `" + pkg + "`: expected string or table.");
+                continue;
+            }
+
+            auto& dtbl = *val.as_table();
+
+            if (auto local = dtbl["path"].value<std::string>()) {
+                std::string resolvedLocal = *local;
+
+                if (!llvm::sys::path::is_absolute(toLlvmRef(resolvedLocal))) {
+                    resolvedLocal = joinPath(ws.rootDir, resolvedLocal);
+                }
+
+                resolvedLocal = makeAbsolutePath(resolvedLocal);
+
+                if (!pathExists(resolvedLocal) || !isDirectory(resolvedLocal)) {
+                    warn("Local dependency `" + pkg + "` path does not exist: " + resolvedLocal);
+                    continue;
+                }
+
+                llvm::outs() << "[LINK] " << pkg << " -> " << resolvedLocal << "\n";
+                continue;
+            }
+
+            if (auto gitUrl = dtbl["git"].value<std::string>()) {
+                if (pathExists(targetDir)) {
+                    llvm::outs() << "[OK] " << pkg << " already fetched at " << targetDir << "\n";
+                    continue;
+                }
+
+                llvm::outs() << "[FETCH] Cloning " << pkg << " from " << *gitUrl << "...\n";
+
+                std::vector<std::string> args;
+                args.emplace_back("clone");
+                args.emplace_back("--depth");
+                args.emplace_back("1");
+
+                if (auto ver = dtbl["version"].value<std::string>(); ver && !ver->empty()) {
+                    args.emplace_back("--branch");
+                    args.emplace_back(*ver);
+                }
+
+                args.emplace_back(*gitUrl);
+                args.emplace_back(targetDir);
+
+                if (runGit(args) != 0) {
+                    warn("Failed to fetch `" + pkg + "`.");
+                    llvm::sys::fs::remove_directories(targetDir, /*IgnoreErrors=*/true);
+                    continue;
+                }
+
+                continue;
+            }
+
+            warn("Skipping dependency `" + pkg + "`: table must include `git` or `path`.");
+        }
+
+        llvm::outs() << "Fetch complete.\n";
     });
 }
 

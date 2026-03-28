@@ -1,71 +1,91 @@
 cmake_minimum_required(VERSION 3.20)
+
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+
 project(arknet VERSION 1.0.0 LANGUAGES C CXX)
 
-# =========================================================
-# 1. Global Settings
-# =========================================================
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Load our Custom Modules (The "cmake/" folder)
+if(NOT WIN32)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
-# Load Helper Functions (add_ark_tool)
 include(ArkAddTool)
 
-# Control Flags
 option(ARK_BUILD_TOOLS "Build Compiler Stack (LLVM/MLIR)" ON)
 option(ARK_BUILD_SERVICES "Build Backend Stack (Drogon/Postgres)" ON)
 
-# =========================================================
-# 2. Core Libraries (The Foundation)
-# =========================================================
-# These have NO dependencies on LLVM or Drogon.
-# ORDER MATTERS: Primitives first, then consumers.
+option(ARK_ENABLE_GPU "Enable GPU codegen support" ON)
+option(ARK_ENABLE_AMDGPU "Enable AMDGPU backend support" ON)
+option(ARK_ENABLE_NVPTX "Enable NVPTX backend support" ON)
+option(ARK_ENABLE_SPIRV "Enable SPIR-V oriented paths" ON)
+
+set(ARK_REQUESTED_GPU_BACKENDS)
+set(ARK_GPU_BACKENDS)
+
+if(ARK_ENABLE_GPU)
+    if(ARK_ENABLE_AMDGPU)
+        list(APPEND ARK_REQUESTED_GPU_BACKENDS AMDGPU)
+    endif()
+
+    if(ARK_ENABLE_NVPTX)
+        list(APPEND ARK_REQUESTED_GPU_BACKENDS NVPTX)
+    endif()
+
+    if(ARK_ENABLE_SPIRV)
+        list(APPEND ARK_REQUESTED_GPU_BACKENDS SPIRV)
+    endif()
+else()
+    if(ARK_ENABLE_AMDGPU OR ARK_ENABLE_NVPTX OR ARK_ENABLE_SPIRV)
+        message(STATUS "ARK_ENABLE_GPU=OFF, ignoring individual GPU backend options")
+    endif()
+endif()
+
+set(ARK_GPU_BACKENDS ${ARK_REQUESTED_GPU_BACKENDS} CACHE INTERNAL "Requested Ark GPU backends")
+set(ARK_REQUESTED_GPU_BACKENDS ${ARK_REQUESTED_GPU_BACKENDS} CACHE INTERNAL "Requested Ark GPU backends")
+message(STATUS "Ark requested GPU backends: ${ARK_REQUESTED_GPU_BACKENDS}")
 
 add_subdirectory(libs/ark-abi)
 add_subdirectory(libs/ark-crypto)
+add_subdirectory(libs/ark-wire)
+add_subdirectory(libs/ark-diagnostics)
+add_subdirectory(libs/ark-capsule)
 
-# [FIX] Added missing core libraries
-add_subdirectory(libs/ark-wire)        # Serializers
-add_subdirectory(libs/ark-diagnostics) # Error Types
-add_subdirectory(libs/ark-capsule)     # The Builder SDK (Depends on wire/diag/crypto)
-
-# =========================================================
-# 3. Compiler Stack (Tools)
-# =========================================================
 if(ARK_BUILD_TOOLS)
     message(STATUS "🏗️  Configuring Compiler Toolchain...")
 
-    # [CLEANUP] We use the module 'cmake/ArkMLIR.cmake' to handle 
-    # all the find_package(LLVM) and include(TableGen) boilerplate.
+    if(NOT DEFINED LLVM_DIR OR LLVM_DIR STREQUAL "")
+        message(FATAL_ERROR "LLVM_DIR is required when ARK_BUILD_TOOLS=ON")
+    endif()
+
+    if(NOT DEFINED MLIR_DIR OR MLIR_DIR STREQUAL "")
+        message(FATAL_ERROR "MLIR_DIR is required when ARK_BUILD_TOOLS=ON")
+    endif()
+
     include(ArkMLIR)
 
-    # 1. The Dialects (Moved from lib/ark -> libs/ark-ir)
-    # This provides the 'ArkIR' and 'ArkConversion' libraries.
     add_subdirectory(libs/ark-ir)
-
-    # 2. The CLI Tool
-    # Ensure your folder is named 'tools/compiler' (or 'tools/arkc')
     add_subdirectory(tools/compiler)
-    
-    # [OPTIONAL] Provider Tool
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/provider/CMakeLists.txt")
         add_subdirectory(tools/provider)
     endif()
 endif()
 
-# =========================================================
-# 4. Service Stack (Backend)
-# =========================================================
 if(ARK_BUILD_SERVICES)
     message(STATUS "☁️  Configuring Backend Services...")
 
-    # 1. The Registry (Business Logic)
     add_subdirectory(services/registry)
 
-    # 2. The Website (Frontend - Optional if C++ backend)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/services/website/CMakeLists.txt")
         add_subdirectory(services/website)
     endif()
