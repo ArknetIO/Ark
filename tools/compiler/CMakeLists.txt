@@ -1,3 +1,4 @@
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 cmake_minimum_required(VERSION 3.20)
 # Inherit the root project() from the top-level CMakeLists.txt.
 
@@ -331,44 +332,44 @@ configure_file(
 # 6. GenMIR Reorganization
 # =========================================================
 set(ARK_GENMIR_SOURCES
-  Frontend/GenMIR/GenMIR.Utils.cpp
-  Frontend/GenMIR.cpp
+  src/Frontend/GenMIR/GenMIR.Utils.cpp
+  src/Frontend/GenMIR.cpp
 )
 
 # =========================================================
 # 7. Shared Compiler Sources
 # =========================================================
 set(ARK_COMPILER_SHARED_SOURCES
-  hud.cpp
+  src/Support/Hud.cpp
 
   # Modular Pipeline
-  Pipeline/Compiler.cpp
-  Pipeline/Linker.cpp
-  Pipeline/LinkerGpuFatbin.cpp
-  Integration/CapsuleBackend.cpp
+  src/Pipeline/Compiler.cpp
+  src/Pipeline/Linker.cpp
+  src/Pipeline/LinkerGpuFatbin.cpp
+  src/Integration/CapsuleBackend.cpp
 
   # Frontend
-  Frontend/Lexer.cpp
-  Frontend/Parser.cpp
+  src/Frontend/Lexer.cpp
+  src/Frontend/Parser.cpp
   ${ARK_GENMIR_SOURCES}
-  Frontend/MirBuilder.cpp
-  Frontend/BuiltinNamespaces.cpp
-  Frontend/Intrinsics.cpp
+  src/Frontend/MirBuilder.cpp
+  src/Frontend/BuiltinNamespaces.cpp
+  src/Frontend/Intrinsics.cpp
 
   # Middle-End
-  Analysis/OwnershipVerifier.cpp
-  Analysis/OwnershipUtils.cpp
-  Transforms/DropInsertion.cpp
+  src/Analysis/OwnershipVerifier.cpp
+  src/Analysis/OwnershipUtils.cpp
+  src/Transforms/DropInsertion.cpp
 
   # GPU / ABI passes
-  Transforms/GpuLowering.cpp
-  Transforms/GpuKernelOutlining.cpp
-  Transforms/RuntimeABIVerifier.cpp
+  src/Transforms/GpuLowering.cpp
+  src/Transforms/GpuKernelOutlining.cpp
+  src/Transforms/RuntimeABIVerifier.cpp
 
   # Runtime Manager
-  Frontend/RuntimeManager.cpp
-  Frontend/ModuleRegistry.cpp
-  SymbolRegistry.cpp
+  src/Frontend/RuntimeManager.cpp
+  src/Frontend/ModuleRegistry.cpp
+  src/Frontend/SymbolRegistry.cpp
 
   # Runtime Source Injection
   ${RUNTIME_CORE_SOURCES}
@@ -376,36 +377,31 @@ set(ARK_COMPILER_SHARED_SOURCES
 
 if(ARK_ENABLE_HOST_JIT)
   list(APPEND ARK_COMPILER_SHARED_SOURCES
-    Pipeline/JIT.cpp
+    src/Pipeline/JIT.cpp
   )
 else()
   list(APPEND ARK_COMPILER_SHARED_SOURCES
-    Pipeline/JIT.Disabled.cpp
+    src/Pipeline/JIT.Disabled.cpp
   )
 endif()
 
 # =========================================================
-# 8. Build Targets (arkc & arknet)
+# 8. Build Targets
 # =========================================================
-add_ark_tool(arkc
-  main.cpp
-  ${ARK_COMPILER_SHARED_SOURCES}
-)
-
 add_ark_tool(arknet
-  arknet.cpp
-  CLI/Init.cpp
-  CLI/Common.cpp
-  CLI/Compile.cpp
-  CLI/Registry.cpp
-  CLI/Lsp.cpp
-  CLI/Provider.cpp
-  CLI/Config.cpp
-  CLI/Doctor.cpp
-  CLI/Workspace.cpp
+  src/CLI/Main.cpp
+  src/CLI/Main.cpp
+  src/CLI/Init.cpp
+  src/CLI/Common.cpp
+  src/CLI/Compile.cpp
+  src/CLI/Registry.cpp
+  src/CLI/Lsp.cpp
+  src/CLI/Provider.cpp
+  src/CLI/Config.cpp
+  src/CLI/Doctor.cpp
+  src/CLI/Workspace.cpp
   ${ARK_COMPILER_SHARED_SOURCES}
 )
-
 # =========================================================
 # 9. Common Target Configuration
 # =========================================================
@@ -456,7 +452,7 @@ else()
   set(ARK_DEFAULT_LLVM_BIN_DIR "")
 endif()
 
-foreach(TOOL_TARGET arkc arknet)
+foreach(TOOL_TARGET arknet)
 
   add_dependencies(${TOOL_TARGET}
     ArkMirDialectIncGen
@@ -548,7 +544,7 @@ target_link_libraries(arknet PRIVATE
 # =========================================================
 # 10. Build the Capsule Stub (ark-stub)
 # =========================================================
-add_executable(ark-stub Runner/Stub.cpp)
+add_executable(ark-stub src/Runner/Stub.cpp)
 target_compile_definitions(ark-stub PRIVATE ARK_STUB_STANDALONE)
 
 target_include_directories(ark-stub PRIVATE
@@ -586,7 +582,7 @@ endif()
 # =========================================================
 # 11. Installation
 # =========================================================
-install(TARGETS arkc arknet ark-stub DESTINATION bin)
+install(TARGETS arknet ark-stub DESTINATION bin)
 
 # =========================================================
 # 12. Runtime Headers Preparation

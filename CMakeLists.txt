@@ -29,8 +29,8 @@ option(ARK_ENABLE_AMDGPU "Enable AMDGPU backend support" ON)
 option(ARK_ENABLE_NVPTX "Enable NVPTX backend support" ON)
 option(ARK_ENABLE_SPIRV "Enable SPIR-V oriented paths" ON)
 
-set(ARK_REQUESTED_GPU_BACKENDS)
-set(ARK_GPU_BACKENDS)
+set(ARK_REQUESTED_GPU_BACKENDS "")
+set(ARK_GPU_BACKENDS "")
 
 if(ARK_ENABLE_GPU)
     if(ARK_ENABLE_AMDGPU)
@@ -50,8 +50,22 @@ else()
     endif()
 endif()
 
-set(ARK_GPU_BACKENDS ${ARK_REQUESTED_GPU_BACKENDS} CACHE INTERNAL "Requested Ark GPU backends")
-set(ARK_REQUESTED_GPU_BACKENDS ${ARK_REQUESTED_GPU_BACKENDS} CACHE INTERNAL "Requested Ark GPU backends")
+list(REMOVE_DUPLICATES ARK_REQUESTED_GPU_BACKENDS)
+
+set(
+    ARK_REQUESTED_GPU_BACKENDS
+    "${ARK_REQUESTED_GPU_BACKENDS}"
+    CACHE INTERNAL "Requested Ark GPU backends"
+    FORCE
+)
+
+set(
+    ARK_GPU_BACKENDS
+    "${ARK_REQUESTED_GPU_BACKENDS}"
+    CACHE INTERNAL "Requested Ark GPU backends"
+    FORCE
+)
+
 message(STATUS "Ark requested GPU backends: ${ARK_REQUESTED_GPU_BACKENDS}")
 
 add_subdirectory(libs/ark-abi)
