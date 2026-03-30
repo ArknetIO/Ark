@@ -37,13 +37,6 @@
   #define ARK_VERSION_STRING "dev"
 #endif
 
-#if !defined(_WIN32)
-#include <unistd.h>
-extern "C" {
-    extern char** environ;
-}
-#endif
-
 namespace cl = llvm::cl;
 
 namespace {
@@ -333,12 +326,14 @@ buildInheritedEnv(llvm::SmallVectorImpl<std::string>& storage,
         storage.emplace_back(*e);
     }
 #else
-    if (!::environ) return std::nullopt;
+    extern char** environ;
+    if (!environ) return std::nullopt;
 
-    for (char** e = ::environ; *e != nullptr; ++e) {
+    for (char** e = environ; *e != nullptr; ++e) {
         storage.emplace_back(*e);
     }
 #endif
+
     refs.reserve(storage.size());
     for (auto& s : storage) {
         refs.push_back(s);

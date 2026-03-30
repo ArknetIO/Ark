@@ -1,6 +1,4 @@
 #include "Workspace.h"
-#include "Common.h"
-
 
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
@@ -165,11 +163,15 @@ std::optional<std::string> findWorkspaceManifestUpwards() {
 // -----------------------------------------------------------------------------
 
 toml::table parseTomlOrFatal(const std::string& path, arklang::hud::Hud& hud) {
-    auto parsed = parseTomlFilePortable(path);
+    auto parsed = toml::parse_file(path);
+
     if (!parsed) {
-        fatal(hud, "Failed to parse " + path + ": " + parsed.error);
+        std::ostringstream oss;
+        oss << parsed.error();
+        fatal(hud, "Failed to parse " + path + ": " + oss.str());
     }
-    return parsed.take();
+
+    return std::move(parsed).table();
 }
 
 // -----------------------------------------------------------------------------

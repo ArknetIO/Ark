@@ -1,8 +1,6 @@
 // tools/compiler/CLI/Doctor.cpp
 #include "Doctor.h"
 #include "Config.h"
-#include "Common.h"
-
 
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
@@ -155,17 +153,18 @@ std::optional<toml::table> parseTomlIfExists(
         return std::nullopt;
     }
 
-    auto parsed = parseTomlFilePortable(path);
+    auto parsed = toml::parse_file(path);
     if (!parsed) {
         if (issues) {
-            issues->push_back("Failed to parse " + path + ": " + parsed.error);
+            std::ostringstream oss;
+            oss << "Failed to parse " << path << ": " << parsed.error();
+            issues->push_back(oss.str());
         }
         return std::nullopt;
     }
 
-    return parsed.take();
+    return std::move(parsed).table();
 }
-
 
 // =============================================================================
 // Process Execution Helpers

@@ -1,7 +1,6 @@
 // tools/compiler/CLI/Config.cpp
 #include "Config.h"
 #include "Subcommands.h"
-#include "Common.h"
 #include "ark/crypto/Vault.h"
 
 #include <CLI/CLI.hpp>
@@ -144,24 +143,28 @@ std::optional<toml::table> parseTomlIfExists(const std::string& path, bool warnO
         return std::nullopt;
     }
 
-    auto parsed = parseTomlFilePortable(path);
+    auto parsed = toml::parse_file(path);
     if (!parsed) {
         if (warnOnParseError) {
-            warn("Failed to parse " + path + ": " + parsed.error);
+            std::ostringstream oss;
+            oss << parsed.error();
+            warn("Failed to parse " + path + ": " + oss.str());
         }
         return std::nullopt;
     }
 
-    return parsed.take();
+    return std::move(parsed).table();
 }
 
 toml::table parseTomlOrFail(const std::string& path) {
-    auto parsed = parseTomlFilePortable(path);
+    auto parsed = toml::parse_file(path);
     if (!parsed) {
-        fail("Failed to parse " + path + ": " + parsed.error);
+        std::ostringstream oss;
+        oss << parsed.error();
+        fail("Failed to parse " + path + ": " + oss.str());
     }
 
-    return parsed.take();
+    return std::move(parsed).table();
 }
 
 // =============================================================================

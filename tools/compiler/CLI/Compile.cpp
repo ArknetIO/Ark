@@ -70,18 +70,15 @@
 #include <system_error>
 #include <vector>
 
-#ifndef ARK_VERSION_STRING
-  #define ARK_VERSION_STRING "dev"
-#endif
-
-
 #if !defined(_WIN32)
 #include <unistd.h>
-extern "C" {
-    extern char** environ;
-}
+extern "C" { extern char** environ; }
 #else
 #include <io.h>
+#endif
+
+#ifndef ARK_VERSION_STRING
+  #define ARK_VERSION_STRING "dev"
 #endif
 
 namespace ark::cli {
@@ -236,13 +233,13 @@ buildInheritedEnv(llvm::SmallVectorImpl<std::string>& storage,
         storage.emplace_back(*e);
     }
 #else
-    if (!::environ) return std::nullopt;
+    extern char** environ;
+    if (!environ) return std::nullopt;
 
-    for (char** e = ::environ; *e != nullptr; ++e) {
+    for (char** e = environ; *e != nullptr; ++e) {
         storage.emplace_back(*e);
     }
 #endif
-    
 
     refs.reserve(storage.size());
     for (auto& s : storage) {

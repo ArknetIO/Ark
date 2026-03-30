@@ -1,5 +1,4 @@
 #include "Subcommands.h"
-#include "Common.h"
 
 #include <CLI/CLI.hpp>
 
@@ -276,13 +275,16 @@ void tryRunArknetFetch() {
 // TOML helpers
 // -----------------------------------------------------------------------------
 toml::table loadTomlOrFail(const std::string& path) {
-    auto parsed = parseTomlFilePortable(path);
-    if (!parsed) {
-        fail("Failed to parse " + path + ": " + parsed.error);
-    }
-    return parsed.take();
-}
+    auto parsed = toml::parse_file(path);
 
+    if (!parsed) {
+        std::ostringstream oss;
+        oss << parsed.error();
+        fail("Failed to parse " + path + ": " + oss.str());
+    }
+
+    return std::move(parsed).table();
+}
 
 void writeTextFileAtomicOrFail(const std::string& path, const std::string& content) {
     const std::string tmpPath = path + ".tmp";
