@@ -1,25 +1,29 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <memory>
 #include <cstdint>
+#include <cstddef>
+#include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 #include <variant>
-#include "llvm/ADT/StringMap.h" 
+#include <vector>
+
+#include "llvm/ADT/StringMap.h"
 
 namespace arklang {
 
-
-
+// =============================================================================
+// Effect Flags
+// =============================================================================
+// These constants are used throughout parsing, semantic analysis, and codegen
+// to represent function capabilities as a compact bitmask.
 static constexpr uint32_t EFF_FS  = 1u << 0;
 static constexpr uint32_t EFF_NET = 1u << 1;
 static constexpr uint32_t EFF_IO  = 1u << 2;
 static constexpr uint32_t EFF_SYS = 1u << 3;
 
-
-// [CRITICAL] Forward Declaration
-// Allows ImportDecl to hold a unique_ptr<Module> before Module is fully defined.
+// Forward declaration so ImportDecl can hold a unique_ptr<Module>.
 struct Module;
 
 // =============================================================================
@@ -27,7 +31,7 @@ struct Module;
 // =============================================================================
 
 /**
- * @brief Tracks origin in source file for precise error reporting.
+ * Precise source position used for diagnostics and AST node provenance.
  */
 struct SourceLoc {
     std::string file;
@@ -36,32 +40,113 @@ struct SourceLoc {
 };
 
 /**
- * @brief Execution Domain: Where code runs (Host CPU vs Device GPU).
+ * Execution domain for functions and kernels.
  */
-enum class Domain { Host, CPU, GPU };
-
-/**
- * @brief Memory Space: Physical location of data.
- */
-struct Space {
-    enum Kind { RAM, GPU } kind = RAM;
-    int deviceId = 0;
+enum class Domain {
+    Host,
+    CPU,
+    GPU
 };
 
 /**
- * @brief The "Trinity" Security Model.
- * Functions must explicitly declare these effects (e.g., `fn main() !IO`) to perform sensitive operations.
+ * Memory / placement descriptor.
+ *
+ * Compatibility goals:
+ * - Preserve the old RAM/GPU + deviceId model
+ * - Extend it to support:
+ *     @gpu:0
+ *     @gpu:"route-id"
+ *     @gpu:route
+ *     @runtime preset
+ *
+ * Notes:
+ * - kind describes the broad memory family
+ * - addressKind refines how the target is addressed
+ * - address stores route strings, symbol names, or runtime preset names
+ */
+struct Space {
+    enum Kind {
+        RAM,
+        GPU
+    } kind = RAM;
+
+    enum class AddressKind : uint8_t {
+        Default,
+        DeviceId,
+        RouteLiteral,
+        RouteSymbol,
+        RuntimePreset
+    };
+
+    AddressKind addressKind = AddressKind::Default;
+    int deviceId = 0;
+    std::string address;
+
+    static Space host() {
+        return Space{};
+    }
+
+    static Space gpuDevice(int id) {
+        Space s;
+        s.kind = GPU;
+        s.addressKind = AddressKind::DeviceId;
+        s.deviceId = id;
+        return s;
+    }
+
+    static Space gpuRouteLiteral(std::string route) {
+        Space s;
+        s.kind = GPU;
+        s.addressKind = AddressKind::RouteLiteral;
+        s.address = std::move(route);
+        return s;
+    }
+
+    static Space gpuRouteSymbol(std::string symbol) {
+        Space s;
+        s.kind = GPU;
+        s.addressKind = AddressKind::RouteSymbol;
+        s.address = std::move(symbol);
+        return s;
+    }
+
+    static Space runtimePreset(std::string presetName) {
+        Space s;
+        s.kind = GPU;
+        s.addressKind = AddressKind::RuntimePreset;
+        s.address = std::move(presetName);
+        return s;
+    }
+
+    bool isDefault() const {
+        return kind == RAM && addressKind == AddressKind::Default && deviceId == 0 && address.empty();
+    }
+
+    bool operator==(const Space& other) const {
+        return kind == other.kind &&
+               addressKind == other.addressKind &&
+               deviceId == other.deviceId &&
+               address == other.address;
+    }
+
+    bool operator!=(const Space& other) const {
+        return !(*this == other);
+    }
+};
+
+/**
+ * Security capability model.
+ * Functions must explicitly declare these effects to perform sensitive actions.
  */
 enum Effect : uint32_t {
     None = 0,
-    IO   = 1 << 0,  // !IO  -> Raw Hardware/FDs (Console, etc.)
-    NET  = 1 << 1,  // !NET -> Network Sockets
-    FS   = 1 << 2,  // !FS  -> Filesystem Access
-    
-    All  = IO | NET | FS
+    IO   = 1 << 0,
+    NET  = 1 << 1,
+    FS   = 1 << 2,
+    SYS  = 1 << 3,
+
+    All  = IO | NET | FS | SYS
 };
-
-
 
 inline const char* domainToCString(Domain d) {
     switch (d) {
@@ -81,74 +166,86 @@ inline const char* spaceToCString(Space::Kind k) {
 }
 
 inline std::string spaceToString(const Space& sp) {
-    if (sp.kind == Space::GPU) {
-        std::string s = "@gpu:";
-        s += std::to_string(sp.deviceId);
-        return s;
+    if (sp.kind == Space::RAM) {
+        return "@host";
     }
-    return "@host";
-}
 
+    switch (sp.addressKind) {
+        case Space::AddressKind::Default:
+            return "@gpu";
+        case Space::AddressKind::DeviceId:
+            return "@gpu:" + std::to_string(sp.deviceId);
+        case Space::AddressKind::RouteLiteral:
+            return "@gpu:\"" + sp.address + "\"";
+        case Space::AddressKind::RouteSymbol:
+            return "@gpu:" + sp.address;
+        case Space::AddressKind::RuntimePreset:
+            return "@runtime " + sp.address;
+    }
+
+    return "@gpu";
+}
 
 // =============================================================================
 // 2. Type System
 // =============================================================================
 
 struct Type {
-    enum Kind { 
-        Void, 
-        // Primitives
-        I8, I16, I32, I64, 
-        U8, U16, U32, U64, 
-        F32, F64, 
-        Bool, 
-        Str, 
-        Func, // fn(A, B) -> R
+    enum Kind {
+        Void,
+
+        // Primitive scalars
+        I8, I16, I32, I64,
+        U8, U16, U32, U64,
+        F32, F64,
+        Bool,
+        Str,
+
+        // Compound / callable
+        Func,
         Ptr,
-        // Containers (The Holy Trinity)
-        Vec,    // vec<T>   -> genericArgs[0] is T
-        Slice,  // slice<T> -> genericArgs[0] is T
-        Tensor, // tensor<T>
-        
-        // Compound
-        Schema,    // Concrete User-defined (Struct/Enum) e.g. Point
-        Generic,   // Generic Instantiation (e.g. Box<i32>)
-        Tuple      // Anonymous product: (i32, f32)
 
-    } kind = Void; 
+        // Containers
+        Vec,
+        Slice,
+        Tensor,
 
-    // Function Types
+        // User / generic / tuple
+        Schema,
+        Generic,
+        Tuple
+    } kind = Void;
+
+    // Function type shape
     std::vector<Type> paramTypes;
     std::shared_ptr<Type> funcReturnType;
-    
-    // [FIX] Unified Generics System
-    // Used by: Vec, Slice, Tensor, Generic, Schema
-    // Example: vec<i32> stores {Type::I32} here.
-    std::vector<Type> genericArgs; 
-    
-    // Identity
-    std::string schemaName; 
 
-    // Tensor Shape (Literal)
-    std::vector<std::string> shape; 
-    
-    // Tuple Subtypes
-    std::vector<Type> subtypes; 
+    // Generic arguments:
+    //   vec<i32>      -> { i32 }
+    //   tensor<f32>   -> { f32 }
+    //   Box<i32, f32> -> { i32, f32 }
+    std::vector<Type> genericArgs;
 
-    // Memory location (RAM/GPU)
-    Space space; 
-    
-    // --- Helpers ---
+    // User-defined type name or generic base name
+    std::string schemaName;
 
-    bool isScalar() const { 
-        // [FIX] Pointers are scalars (hold a single memory address)
+    // Optional shape metadata for tensors / shaped user constructs
+    std::vector<std::string> shape;
+
+    // Tuple element types
+    std::vector<Type> subtypes;
+
+    // Resolved / declared memory placement
+    Space space;
+
+    bool isScalar() const {
         return (kind >= I8 && kind <= Bool) || kind == Ptr;
     }
 
     bool isContainer() const {
         return kind == Vec || kind == Slice || kind == Tensor;
     }
-    
+
     bool isInteger() const {
         return (kind >= I8 && kind <= I64) || (kind >= U8 && kind <= U64);
     }
@@ -157,107 +254,87 @@ struct Type {
         return kind == F32 || kind == F64;
     }
 
-    // [ADD THIS HELPER]
     bool isSigned() const {
         return kind == I8 || kind == I16 || kind == I32 || kind == I64;
     }
-    
-    // [NEW] Helper to get inner type safely
-    // Returns Void type if not applicable
+
     Type getInnerType() const {
         if (!genericArgs.empty()) return genericArgs[0];
         return {Void};
     }
-    
-    // Equality Check (Deep comparison)
+
     bool operator==(const Type& other) const {
         if (kind != other.kind) return false;
-        
-        // Deep Check for Containers & Generics
-        if (isContainer() || kind == Schema || kind == Generic) {
-            if (kind == Schema || kind == Generic) {
-                if (schemaName != other.schemaName) return false;
-            }
-            // Recursive check for T inside vec<T>
-            if (genericArgs.size() != other.genericArgs.size()) return false;
-            for (size_t i = 0; i < genericArgs.size(); ++i) {
-                if (genericArgs[i] != other.genericArgs[i]) return false;
-            }
-            return true;
+        if (space != other.space) return false;
+        if (schemaName != other.schemaName) return false;
+        if (shape != other.shape) return false;
+
+        if (genericArgs.size() != other.genericArgs.size()) return false;
+        for (std::size_t i = 0; i < genericArgs.size(); ++i) {
+            if (genericArgs[i] != other.genericArgs[i]) return false;
         }
 
-        if (kind == Tuple) {
-            if (subtypes.size() != other.subtypes.size()) return false;
-            for (size_t i = 0; i < subtypes.size(); ++i) {
-                if (subtypes[i] != other.subtypes[i]) return false;
-            }
-            return true;
+        if (subtypes.size() != other.subtypes.size()) return false;
+        for (std::size_t i = 0; i < subtypes.size(); ++i) {
+            if (subtypes[i] != other.subtypes[i]) return false;
         }
-        
-        // For Functions
-        if (kind == Func) {
-             if (paramTypes.size() != other.paramTypes.size()) return false;
-             for(size_t i=0; i<paramTypes.size(); ++i) 
-                 if(paramTypes[i] != other.paramTypes[i]) return false;
-             // Compare return types (handle nulls safely)
-             if ((funcReturnType && !other.funcReturnType) || (!funcReturnType && other.funcReturnType)) return false;
-             if (funcReturnType && *funcReturnType != *other.funcReturnType) return false;
-             return true;
+
+        if (paramTypes.size() != other.paramTypes.size()) return false;
+        for (std::size_t i = 0; i < paramTypes.size(); ++i) {
+            if (paramTypes[i] != other.paramTypes[i]) return false;
         }
+
+        if (static_cast<bool>(funcReturnType) != static_cast<bool>(other.funcReturnType)) return false;
+        if (funcReturnType && other.funcReturnType && *funcReturnType != *other.funcReturnType) return false;
 
         return true;
     }
 
-    bool operator!=(const Type& other) const { return !(*this == other); }
-
-    // inside struct Type
+    bool operator!=(const Type& other) const {
+        return !(*this == other);
+    }
 
     std::string toString() const {
         struct Printer {
-            size_t maxList;
+            std::size_t maxList;
             std::string out;
 
-            explicit Printer(size_t limit) : maxList(limit) {}
+            explicit Printer(std::size_t limit) : maxList(limit) {}
 
-            static const char* kindName(Kind k) {
+            static const char* kindName(Type::Kind k) {
                 switch (k) {
-                    case Void:   return "void";
-                    case I8:     return "i8";
-                    case I16:    return "i16";
-                    case I32:    return "i32";
-                    case I64:    return "i64";
-                    case U8:     return "u8";
-                    case U16:    return "u16";
-                    case U32:    return "u32";
-                    case U64:    return "u64";
-                    case F32:    return "f32";
-                    case F64:    return "f64";
-                    case Bool:   return "bool";
-                    case Str:    return "str";
-                    case Func:   return "fn";
-                    case Ptr:    return "ptr";
-                    case Vec:    return "vec";
-                    case Slice:  return "slice";
-                    case Tensor: return "tensor";
-                    case Schema: return "schema";
-                    case Generic:return "generic";
-                    case Tuple:  return "tuple";
+                    case Type::Void:   return "void";
+                    case Type::I8:     return "i8";
+                    case Type::I16:    return "i16";
+                    case Type::I32:    return "i32";
+                    case Type::I64:    return "i64";
+                    case Type::U8:     return "u8";
+                    case Type::U16:    return "u16";
+                    case Type::U32:    return "u32";
+                    case Type::U64:    return "u64";
+                    case Type::F32:    return "f32";
+                    case Type::F64:    return "f64";
+                    case Type::Bool:   return "bool";
+                    case Type::Str:    return "str";
+                    case Type::Func:   return "fn";
+                    case Type::Ptr:    return "ptr";
+                    case Type::Vec:    return "vec";
+                    case Type::Slice:  return "slice";
+                    case Type::Tensor: return "tensor";
+                    case Type::Schema: return "schema";
+                    case Type::Generic:return "generic";
+                    case Type::Tuple:  return "tuple";
                 }
                 return "unknown";
             }
 
             void printSpace(const Space& sp) {
-                if (sp.kind == Space::GPU) {
-                    out += "@gpu:";
-                    out += std::to_string(sp.deviceId);
-                } else {
-                    out += "@host";
-                }
+                out += spaceToString(sp);
             }
 
             void print(const Type& t) {
                 switch (t.kind) {
-                    case Func: {
+                    case Type::Func: {
                         out += "fn(";
                         printTypeList(t.paramTypes, ", ");
                         out += ") -> ";
@@ -266,36 +343,42 @@ struct Type {
                         printSpace(t.space);
                         return;
                     }
-                    case Ptr: {
+
+                    case Type::Ptr: {
                         out += "*";
                         if (!t.genericArgs.empty()) print(t.genericArgs[0]);
                         else out += "void";
                         printSpace(t.space);
                         return;
                     }
-                    case Vec:
-                    case Slice:
-                    case Tensor: {
+
+                    case Type::Vec:
+                    case Type::Slice:
+                    case Type::Tensor: {
                         out += kindName(t.kind);
                         printGenericArgs(t.genericArgs);
+                        if (!t.shape.empty()) printShape(t.shape);
                         printSpace(t.space);
                         return;
                     }
-                    case Schema:
-                    case Generic: {
+
+                    case Type::Schema:
+                    case Type::Generic: {
                         out += (!t.schemaName.empty() ? t.schemaName : kindName(t.kind));
                         if (!t.genericArgs.empty()) printGenericArgs(t.genericArgs);
                         if (!t.shape.empty()) printShape(t.shape);
                         printSpace(t.space);
                         return;
                     }
-                    case Tuple: {
+
+                    case Type::Tuple: {
                         out += "(";
                         printTypeList(t.subtypes, ", ");
                         out += ")";
                         printSpace(t.space);
                         return;
                     }
+
                     default: {
                         out += kindName(t.kind);
                         printSpace(t.space);
@@ -316,29 +399,32 @@ struct Type {
 
             void printShape(const std::vector<std::string>& dims) {
                 out += "[";
-                const size_t n = dims.size();
-                const size_t take = (n > maxList) ? maxList : n;
+                const std::size_t n = dims.size();
+                const std::size_t take = (n > maxList) ? maxList : n;
 
-                for (size_t i = 0; i < take; ++i) {
+                for (std::size_t i = 0; i < take; ++i) {
                     if (i) out += ", ";
                     out += dims[i].empty() ? "?" : dims[i];
                 }
+
                 if (take < n) {
                     out += ", ...(+";
                     out += std::to_string(n - take);
                     out += ")";
                 }
+
                 out += "]";
             }
 
             void printTypeList(const std::vector<Type>& ts, const char* sep) {
-                const size_t n = ts.size();
-                const size_t take = (n > maxList) ? maxList : n;
+                const std::size_t n = ts.size();
+                const std::size_t take = (n > maxList) ? maxList : n;
 
-                for (size_t i = 0; i < take; ++i) {
+                for (std::size_t i = 0; i < take; ++i) {
                     if (i) out += sep;
                     print(ts[i]);
                 }
+
                 if (take < n) {
                     out += sep;
                     out += "...(+";
@@ -352,156 +438,238 @@ struct Type {
         p.print(*this);
         return p.out;
     }
-
-
 };
 
 // =============================================================================
-// 3. AST Node Definitions
+// 3. AST Node Kinds
 // =============================================================================
+
 enum class ExprKind {
-    // Basic
-    Symbol, Literal, String, Tuple,
-    
-    // Operations
-    Binary, Unary, Index,
-    
-    // Memory/Async
-    Alloc, Launch, Call, Await, Import,
-    
-    // Control Flow
-    Block, If, Match, Return,
-    
+    // Basic values
+    Symbol,
+    Literal,
+    String,
+    Tuple,
+
+    // Operators / access
+    Binary,
+    Unary,
+    Index,
+
+    // Calls / async / runtime
+    Alloc,
+    Launch,
+    Call,
+    Await,
+    Import,
+    RuntimeLiteral,
+
+    // Control flow
+    Block,
+    If,
+    Match,
+    Return,
+    Break,
+    Continue,
+
     // Loops
-    While, For, Iter, ParLoop,
-    
-    // Variables & IO
-    Let, Assign, Print,
-    
-    // Data Construction
-    ArrayLiteral, Range,
-    SchemaExpr,   // Point { x: 1 }
-    MemberAccess, // p.x
-    MemberCall,    // vec.push(1)
+    While,
+    For,
+    Iter,
+    ParLoop,
+
+    // Variables / side effects
+    Let,
+    Assign,
+    Print,
+
+    // Data construction / member ops
+    ArrayLiteral,
+    Range,
+    SchemaExpr,
+    MemberAccess,
+    MemberCall,
     Lambda
 };
 
-// Base AST Node
-struct Expr { 
+// =============================================================================
+// 4. Base AST Nodes
+// =============================================================================
+
+struct Expr {
     ExprKind kind;
     SourceLoc loc;
-    
-    // [ADD THIS] Virtual toString method
+
     virtual std::string toString() const {
         switch (kind) {
-            case ExprKind::Symbol:   return "Symbol";
-            case ExprKind::Literal:  return "Literal";
-            case ExprKind::Call:     return "Call";
-            case ExprKind::Alloc:    return "alloc";
-            case ExprKind::MemberAccess: return "MemberAccess";
-            case ExprKind::Import:   return "Import";
-            case ExprKind::String:   return "String";
-            case ExprKind::Tuple:    return "Tuple";
-            default: return "Expr";
+            case ExprKind::Symbol:         return "Symbol";
+            case ExprKind::Literal:        return "Literal";
+            case ExprKind::String:         return "String";
+            case ExprKind::Tuple:          return "Tuple";
+            case ExprKind::Binary:         return "Binary";
+            case ExprKind::Unary:          return "Unary";
+            case ExprKind::Index:          return "Index";
+            case ExprKind::Alloc:          return "Alloc";
+            case ExprKind::Launch:         return "Launch";
+            case ExprKind::Call:           return "Call";
+            case ExprKind::Await:          return "Await";
+            case ExprKind::Import:         return "Import";
+            case ExprKind::RuntimeLiteral: return "RuntimeLiteral";
+            case ExprKind::Block:          return "Block";
+            case ExprKind::If:             return "If";
+            case ExprKind::Match:          return "Match";
+            case ExprKind::Return:         return "Return";
+            case ExprKind::Break:          return "Break";
+            case ExprKind::Continue:       return "Continue";
+            case ExprKind::While:          return "While";
+            case ExprKind::For:            return "For";
+            case ExprKind::Iter:           return "Iter";
+            case ExprKind::ParLoop:        return "ParLoop";
+            case ExprKind::Let:            return "Let";
+            case ExprKind::Assign:         return "Assign";
+            case ExprKind::Print:          return "Print";
+            case ExprKind::ArrayLiteral:   return "ArrayLiteral";
+            case ExprKind::Range:          return "Range";
+            case ExprKind::SchemaExpr:     return "SchemaExpr";
+            case ExprKind::MemberAccess:   return "MemberAccess";
+            case ExprKind::MemberCall:     return "MemberCall";
+            case ExprKind::Lambda:         return "Lambda";
         }
+        return "Expr";
     }
-    virtual ~Expr() = default; 
-    
-    protected: Expr(ExprKind k, SourceLoc l) : kind(k), loc(std::move(l)) {}
+
+    virtual ~Expr() = default;
+
+protected:
+    Expr(ExprKind k, SourceLoc l) : kind(k), loc(std::move(l)) {}
 };
 
-// [NEW] Base Declaration Node
-// Allows parsing Functions, Schemas, and Imports uniformly.
 struct Decl {
     virtual ~Decl() = default;
 };
 
-// -----------------------------------------------------------------------------
-// Module System
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 5. Module / Import System
+// =============================================================================
 
 struct ImportDecl : public Expr, public Decl {
-    std::string path;  // "math/vectors.ark"
-    std::string alias; // "v"
+    std::string path;
+    std::string alias;
 
-    // [CRITICAL ADDITION] 
-    // The Parser populates this with the AST of the imported file.
-    // ArkCodeGen reads this to resolve types like 'v.Vector'.
+    // Populated by the parser or import loader with the imported AST.
     std::unique_ptr<Module> importedModule;
 
-    ImportDecl(SourceLoc l, std::string p, std::string a) 
+    ImportDecl(SourceLoc l, std::string p, std::string a)
         : Expr(ExprKind::Import, l), path(std::move(p)), alias(std::move(a)) {}
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Import; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Import;
+    }
 };
 
-// -----------------------------------------------------------------------------
-// Values & Variables
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 6. Values & Primitive Expressions
+// =============================================================================
 
 struct SymbolExpr : public Expr {
     std::string name;
-    SymbolExpr(SourceLoc l, std::string n) : Expr(ExprKind::Symbol, l), name(std::move(n)) {}
-    
-    std::string toString() const override { return name; }
-    
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Symbol; }
+
+    SymbolExpr(SourceLoc l, std::string n)
+        : Expr(ExprKind::Symbol, l), name(std::move(n)) {}
+
+    std::string toString() const override {
+        return name;
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Symbol;
+    }
 };
 
 struct LiteralExpr : public Expr {
-    std::string value; // Stored as string, parsed by CodeGen
+    std::string value;
     Type type;
-    LiteralExpr(SourceLoc l, std::string v, Type t) 
-        : Expr(ExprKind::Literal, l), value(std::move(v)), type(std::move(t)) {}
-    
-    std::string toString() const override { return value; }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Literal; }
+    LiteralExpr(SourceLoc l, std::string v, Type t)
+        : Expr(ExprKind::Literal, l), value(std::move(v)), type(std::move(t)) {}
+
+    std::string toString() const override {
+        return value;
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Literal;
+    }
 };
 
 struct StringExpr : public Expr {
     std::string value;
-    StringExpr(SourceLoc l, std::string v) 
-        : Expr(ExprKind::String, l), value(std::move(v)) {}
-    
-    std::string toString() const override { return "\"" + value + "\""; }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::String; }
+    StringExpr(SourceLoc l, std::string v)
+        : Expr(ExprKind::String, l), value(std::move(v)) {}
+
+    std::string toString() const override {
+        return "\"" + value + "\"";
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::String;
+    }
 };
 
 struct TupleExpr : public Expr {
     std::vector<std::unique_ptr<Expr>> elements;
+
     TupleExpr(SourceLoc l, std::vector<std::unique_ptr<Expr>> e)
         : Expr(ExprKind::Tuple, l), elements(std::move(e)) {}
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Tuple; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Tuple;
+    }
 };
-// -----------------------------------------------------------------------------
-// Operations
-// -----------------------------------------------------------------------------
+
+// =============================================================================
+// 7. Operators & Access
+// =============================================================================
 
 struct BinaryExpr : public Expr {
-    std::string op; 
-    std::unique_ptr<Expr> lhs, rhs;
-    BinaryExpr(SourceLoc l, std::string o, std::unique_ptr<Expr> L, std::unique_ptr<Expr> R) 
+    std::string op;
+    std::unique_ptr<Expr> lhs;
+    std::unique_ptr<Expr> rhs;
+
+    BinaryExpr(SourceLoc l, std::string o, std::unique_ptr<Expr> L, std::unique_ptr<Expr> R)
         : Expr(ExprKind::Binary, l), op(std::move(o)), lhs(std::move(L)), rhs(std::move(R)) {}
 
-    std::string toString() const override { return "Binary(" + op + ")"; }
+    std::string toString() const override {
+        return "Binary(" + op + ")";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Binary; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Binary;
+    }
+};
+
+struct UnaryExpr : public Expr {
+    std::string op;
+    std::unique_ptr<Expr> operand;
+
+    UnaryExpr(SourceLoc l, std::string o, std::unique_ptr<Expr> expr)
+        : Expr(ExprKind::Unary, l), op(std::move(o)), operand(std::move(expr)) {}
+
+    std::string toString() const override {
+        return "Unary(" + op + ")";
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Unary;
+    }
 };
 
 struct IndexExpr : public Expr {
     std::unique_ptr<Expr> base;
     std::unique_ptr<Expr> index;
 
-    // Filled by TypeChecker/CodeGen (for method calls on arrays)
+    // Filled during typechecking / lowering for downstream consumers.
     Type resolvedType = { Type::Void };
 
     IndexExpr(SourceLoc l, std::unique_ptr<Expr> b, std::unique_ptr<Expr> idx)
@@ -511,120 +679,217 @@ struct IndexExpr : public Expr {
         return (base ? base->toString() : std::string("<null>")) + "[...]";
     }
 
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Index; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Index;
+    }
 };
 
-// -----------------------------------------------------------------------------
-// Functions & Calls
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 8. Calls
+// =============================================================================
 
 struct CallArg {
-    std::string name; // "argName" or "" if positional
+    std::string name;
     std::unique_ptr<Expr> value;
-    
-    CallArg(std::string n, std::unique_ptr<Expr> v) 
+
+    CallArg(std::string n, std::unique_ptr<Expr> v)
         : name(std::move(n)), value(std::move(v)) {}
 };
 
 struct CallExpr : public Expr {
     std::unique_ptr<Expr> callee;
     std::vector<CallArg> args;
-    
-    // Storage for generics like foo<T>(...)
-    std::vector<Type> explicitGenericArgs; 
 
-    CallExpr(SourceLoc loc, 
-             std::unique_ptr<Expr> callee, 
-             std::vector<CallArg> args,
-             std::vector<Type> genericArgs = {}) // Defaults to empty
-        : Expr(ExprKind::Call, loc), 
-          callee(std::move(callee)), 
-          args(std::move(args)), 
+    // Explicit generic arguments:
+    //   foo<T, U>(...)
+    std::vector<Type> explicitGenericArgs;
+
+    CallExpr(SourceLoc loc,
+             std::unique_ptr<Expr> calleeExpr,
+             std::vector<CallArg> a,
+             std::vector<Type> genericArgs = {})
+        : Expr(ExprKind::Call, loc),
+          callee(std::move(calleeExpr)),
+          args(std::move(a)),
           explicitGenericArgs(std::move(genericArgs)) {}
 
-    std::string toString() const override { return "Call"; }
+    std::string toString() const override {
+        return "Call";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Call; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Call;
+    }
 };
 
-// -----------------------------------------------------------------------------
-// Memory & Async
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 9. Runtime Literals, Allocation & Async
+// =============================================================================
+
+struct RuntimeFieldInit {
+    std::string name;
+    std::unique_ptr<Expr> value;
+
+    RuntimeFieldInit(std::string n, std::unique_ptr<Expr> v)
+        : name(std::move(n)), value(std::move(v)) {}
+};
+
+struct RuntimeLiteralExpr : public Expr {
+    std::vector<RuntimeFieldInit> fields;
+
+    RuntimeLiteralExpr(SourceLoc l, std::vector<RuntimeFieldInit> f)
+        : Expr(ExprKind::RuntimeLiteral, l), fields(std::move(f)) {}
+
+    std::string toString() const override {
+        return "runtime{...}";
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::RuntimeLiteral;
+    }
+};
 
 struct AllocExpr : public Expr {
     Type type;
-    std::string location; // "gpu:0" (Optional)
 
-    AllocExpr(SourceLoc l, Type t, std::string locStr = "") 
+    // Legacy textual spelling preserved for compatibility with existing passes.
+    // Examples:
+    //   ""
+    //   "@gpu:0"
+    //   "@gpu:\"route-id\""
+    //   "@gpu:route"
+    //   "@runtime preset"
+    std::string location;
+
+    // Structured placement form for new lowering paths.
+    std::optional<Space> placement;
+
+    AllocExpr(SourceLoc l, Type t, std::string locStr = "")
         : Expr(ExprKind::Alloc, l), type(std::move(t)), location(std::move(locStr)) {}
-    
-    std::string toString() const override { return "alloc"; }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Alloc; }
+    AllocExpr(SourceLoc l, Type t, Space sp)
+        : Expr(ExprKind::Alloc, l),
+          type(std::move(t)),
+          location(spaceToString(sp)),
+          placement(std::move(sp)) {}
+
+    std::string toString() const override {
+        return location.empty() ? "alloc" : "alloc " + location;
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Alloc;
+    }
 };
 
 struct LaunchExpr : public Expr {
-    std::string destVar;   // Result variable
+    std::string destVar;
     std::string kernelName;
-    std::vector<CallArg> args; 
-    std::string tokenName; // Optional async token handle
-    
-    LaunchExpr(SourceLoc l, std::string d, std::string k, std::vector<CallArg> a, std::string t) 
-        : Expr(ExprKind::Launch, l), destVar(std::move(d)), kernelName(std::move(k)), args(std::move(a)), tokenName(std::move(t)) {}
+    std::vector<CallArg> args;
+    std::string tokenName;
 
-    std::string toString() const override { 
-        return "launch " + kernelName + " -> " + destVar; 
+    // Optional runtime routing annotation.
+    // For current grammar this is typically:
+    //   @runtime preset
+    std::string runtimeName;
+    std::optional<Space> runtime;
+
+    LaunchExpr(SourceLoc l,
+               std::string d,
+               std::string k,
+               std::vector<CallArg> a,
+               std::string t,
+               std::string rt = "")
+        : Expr(ExprKind::Launch, l),
+          destVar(std::move(d)),
+          kernelName(std::move(k)),
+          args(std::move(a)),
+          tokenName(std::move(t)),
+          runtimeName(std::move(rt)) {}
+
+    LaunchExpr(SourceLoc l,
+               std::string d,
+               std::string k,
+               std::vector<CallArg> a,
+               std::string t,
+               Space rt)
+        : Expr(ExprKind::Launch, l),
+          destVar(std::move(d)),
+          kernelName(std::move(k)),
+          args(std::move(a)),
+          tokenName(std::move(t)),
+          runtimeName(rt.addressKind == Space::AddressKind::RuntimePreset ? rt.address : std::string()),
+          runtime(std::move(rt)) {}
+
+    std::string toString() const override {
+        std::string s = "launch " + kernelName + " -> " + destVar;
+        if (!tokenName.empty()) s += " as " + tokenName;
+        if (!runtimeName.empty()) s += " @runtime " + runtimeName;
+        return s;
     }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Launch; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Launch;
+    }
 };
 
 struct AwaitExpr : public Expr {
     std::string tokenName;
-    AwaitExpr(SourceLoc l, std::string t) : Expr(ExprKind::Await, l), tokenName(std::move(t)) {}
 
-    std::string toString() const override { 
-        return "await " + tokenName; 
+    AwaitExpr(SourceLoc l, std::string t)
+        : Expr(ExprKind::Await, l), tokenName(std::move(t)) {}
+
+    std::string toString() const override {
+        return "await " + tokenName;
     }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Await; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Await;
+    }
 };
 
-// -------------// -----------------------------------------------------------------------------
-// Statements & Control Flow
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 10. Statements & Control Flow
+// =============================================================================
 
 struct BlockExpr : public Expr {
     std::vector<std::unique_ptr<Expr>> stmts;
+
     BlockExpr(SourceLoc l, std::vector<std::unique_ptr<Expr>> s)
         : Expr(ExprKind::Block, l), stmts(std::move(s)) {}
 
-    std::string toString() const override { return "Block"; }
+    std::string toString() const override {
+        return "Block";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Block; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Block;
+    }
 };
 
 struct VarDecl : public Expr {
-    std::vector<std::string> names; // Supports destructuring: let (a, b) = ...
+    std::vector<std::string> names;
     std::optional<Type> annotation;
     std::unique_ptr<Expr> init;
-    
-    VarDecl(SourceLoc l, std::vector<std::string> n, std::optional<Type> ann, std::unique_ptr<Expr> i)
-        : Expr(ExprKind::Let, l), names(std::move(n)), annotation(std::move(ann)), init(std::move(i)) {}
 
-    std::string toString() const override { 
+    VarDecl(SourceLoc l,
+            std::vector<std::string> n,
+            std::optional<Type> ann,
+            std::unique_ptr<Expr> i)
+        : Expr(ExprKind::Let, l),
+          names(std::move(n)),
+          annotation(std::move(ann)),
+          init(std::move(i)) {}
+
+    std::string toString() const override {
         if (names.empty()) return "let (empty)";
         if (names.size() == 1) return "let " + names[0];
-        return "let (" + names[0] + ", ...)"; 
+        return "let (" + names[0] + ", ...)";
     }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Let; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Let;
+    }
 };
 
 struct LambdaExpr : public Expr {
@@ -632,81 +897,127 @@ struct LambdaExpr : public Expr {
         std::string name;
         Type type;
     };
-    
-    std::vector<Param> params;
-    Type returnType;            // Can be Void if inferred/omitted
-    std::unique_ptr<Expr> body; // BlockExpr or generic Expr
-    bool explicitReturn;        // True if user wrote "-> T"
 
-    LambdaExpr(SourceLoc l, std::vector<Param> p, Type rt, std::unique_ptr<Expr> b, bool expl)
-        : Expr(ExprKind::Lambda, l), 
-          params(std::move(p)), 
-          returnType(std::move(rt)), 
-          body(std::move(b)), 
+    std::vector<Param> params;
+    Type returnType;
+    std::unique_ptr<Expr> body;
+    bool explicitReturn = false;
+
+    LambdaExpr(SourceLoc l,
+               std::vector<Param> p,
+               Type rt,
+               std::unique_ptr<Expr> b,
+               bool expl)
+        : Expr(ExprKind::Lambda, l),
+          params(std::move(p)),
+          returnType(std::move(rt)),
+          body(std::move(b)),
           explicitReturn(expl) {}
 
-    std::string toString() const override { return "lambda"; }
+    std::string toString() const override {
+        return "lambda";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Lambda; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Lambda;
+    }
 };
 
 struct AssignStmt : public Expr {
-    std::unique_ptr<Expr> target; // L-Value (Symbol, Index, Member)
-    std::unique_ptr<Expr> value;  // R-Value
-    
+    std::unique_ptr<Expr> target;
+    std::unique_ptr<Expr> value;
+
     AssignStmt(SourceLoc l, std::unique_ptr<Expr> t, std::unique_ptr<Expr> v)
         : Expr(ExprKind::Assign, l), target(std::move(t)), value(std::move(v)) {}
-    
-    std::string toString() const override { 
-        return target->toString() + " = ..."; 
+
+    std::string toString() const override {
+        return (target ? target->toString() : std::string("<null>")) + " = ...";
     }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Assign; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Assign;
+    }
 };
 
-// [FIX] Renamed ReturnExpr -> ReturnStmt to match GenMIR usage
 struct ReturnStmt : public Expr {
-    std::unique_ptr<Expr> value; // null for void return
+    std::unique_ptr<Expr> value;
+
     ReturnStmt(SourceLoc l, std::unique_ptr<Expr> v)
         : Expr(ExprKind::Return, l), value(std::move(v)) {}
 
-    std::string toString() const override { return "return"; }
+    std::string toString() const override {
+        return "return";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Return; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Return;
+    }
+};
+
+struct BreakStmt : public Expr {
+    BreakStmt(SourceLoc l)
+        : Expr(ExprKind::Break, l) {}
+
+    std::string toString() const override {
+        return "break";
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Break;
+    }
+};
+
+struct ContinueStmt : public Expr {
+    ContinueStmt(SourceLoc l)
+        : Expr(ExprKind::Continue, l) {}
+
+    std::string toString() const override {
+        return "continue";
+    }
+
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Continue;
+    }
 };
 
 struct IfStmt : public Expr {
     std::unique_ptr<Expr> condition;
     std::unique_ptr<Expr> thenBranch;
-    std::unique_ptr<Expr> elseBranch; // Can be IfStmt (else if) or Block (else)
+    std::unique_ptr<Expr> elseBranch;
 
     IfStmt(SourceLoc l, std::unique_ptr<Expr> c, std::unique_ptr<Expr> t, std::unique_ptr<Expr> e)
-        : Expr(ExprKind::If, l), condition(std::move(c)), thenBranch(std::move(t)), elseBranch(std::move(e)) {}
+        : Expr(ExprKind::If, l),
+          condition(std::move(c)),
+          thenBranch(std::move(t)),
+          elseBranch(std::move(e)) {}
 
-    std::string toString() const override { return "if"; }
+    std::string toString() const override {
+        return "if";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::If; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::If;
+    }
 };
 
-// -----------------------------------------------------------------------------
-// Loops
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 11. Loops
+// =============================================================================
 
 struct WhileStmt : public Expr {
     std::unique_ptr<Expr> condition;
     std::unique_ptr<Expr> body;
-    
+
     WhileStmt(SourceLoc l, std::unique_ptr<Expr> c, std::unique_ptr<Expr> b)
         : Expr(ExprKind::While, l), condition(std::move(c)), body(std::move(b)) {}
 
-    std::string toString() const override { return "while"; }
+    std::string toString() const override {
+        return "while";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::While; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::While;
+    }
 };
 
 struct ForStmt : public Expr {
@@ -715,44 +1026,58 @@ struct ForStmt : public Expr {
     std::unique_ptr<Expr> end;
     std::unique_ptr<Expr> body;
 
-    ForStmt(SourceLoc l, std::string iv, std::unique_ptr<Expr> s, std::unique_ptr<Expr> e, std::unique_ptr<Expr> b)
-        : Expr(ExprKind::For, l), iterVar(std::move(iv)), start(std::move(s)), end(std::move(e)), body(std::move(b)) {}
+    ForStmt(SourceLoc l,
+            std::string iv,
+            std::unique_ptr<Expr> s,
+            std::unique_ptr<Expr> e,
+            std::unique_ptr<Expr> b)
+        : Expr(ExprKind::For, l),
+          iterVar(std::move(iv)),
+          start(std::move(s)),
+          end(std::move(e)),
+          body(std::move(b)) {}
 
-    std::string toString() const override { return "for " + iterVar; }
+    std::string toString() const override {
+        return "for " + iterVar;
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::For; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::For;
+    }
 };
 
 struct IterStmt : public Expr {
     std::string iterVar;
-    std::unique_ptr<Expr> collection; // Vector or Tensor
+    std::unique_ptr<Expr> collection;
     std::unique_ptr<Expr> body;
 
     IterStmt(SourceLoc l, std::string iv, std::unique_ptr<Expr> col, std::unique_ptr<Expr> b)
-        : Expr(ExprKind::Iter, l), iterVar(std::move(iv)), collection(std::move(col)), body(std::move(b)) {}
+        : Expr(ExprKind::Iter, l),
+          iterVar(std::move(iv)),
+          collection(std::move(col)),
+          body(std::move(b)) {}
 
-    std::string toString() const override { return "iter " + iterVar; }
+    std::string toString() const override {
+        return "iter " + iterVar;
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Iter; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Iter;
+    }
 };
 
 struct ParLoop : public Expr {
-    // Supports: par i in ...  OR par (x, y) in ...
     std::vector<std::string> iterVars;
 
-    // Domain classification.
-    // Tags the intent at parse time so GenMIR doesn't have to guess.
     enum class DomainKind : uint8_t {
-        Range,     // RangeExpr: 0..N
-        LenSugar,  // Expr: C / member / index -> sugar for 0..len(expr)
-        DimsCall   // CallExpr: dims(out)
+        Range,
+        LenSugar,
+        DimsCall
     };
 
     struct Domain {
         DomainKind kind;
-        std::unique_ptr<Expr> expr; // The actual expression tree
+        std::unique_ptr<Expr> expr;
 
         Domain(DomainKind k, std::unique_ptr<Expr> e)
             : kind(k), expr(std::move(e)) {}
@@ -761,10 +1086,9 @@ struct ParLoop : public Expr {
     Domain domain;
 
     // Launch hints from block(...)
-    // Parser enforces size is 0, 1, 2, or 3.
     std::vector<std::unique_ptr<Expr>> blockDims;
 
-    // Enforced strictly as a BlockExpr ( { ... } )
+    // Body is always a block for structured lowering.
     std::unique_ptr<BlockExpr> body;
 
     ParLoop(SourceLoc l,
@@ -778,82 +1102,100 @@ struct ParLoop : public Expr {
           blockDims(std::move(hints)),
           body(std::move(b)) {}
 
-    std::string toString() const override { return "par"; }
+    std::string toString() const override {
+        return "par";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::ParLoop; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::ParLoop;
+    }
 };
-// -----------------------------------------------------------------------------
-// Schemas & Data Structures
-// -----------------------------------------------------------------------------
+
+// =============================================================================
+// 12. Data Construction & Schemas
+// =============================================================================
 
 struct ArrayLiteral : public Expr {
     std::vector<std::unique_ptr<Expr>> elements;
+
     ArrayLiteral(SourceLoc l, std::vector<std::unique_ptr<Expr>> elms)
         : Expr(ExprKind::ArrayLiteral, l), elements(std::move(elms)) {}
 
-    std::string toString() const override { return "[...]"; }
+    std::string toString() const override {
+        return "[...]";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::ArrayLiteral; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::ArrayLiteral;
+    }
 };
 
 struct RangeExpr : public Expr {
-    std::unique_ptr<Expr> start; // null = 0
-    std::unique_ptr<Expr> end;   // null = len
-    
+    std::unique_ptr<Expr> start;
+    std::unique_ptr<Expr> end;
+
     RangeExpr(SourceLoc l, std::unique_ptr<Expr> s, std::unique_ptr<Expr> e)
         : Expr(ExprKind::Range, l), start(std::move(s)), end(std::move(e)) {}
 
-    std::string toString() const override { return "start..end"; }
+    std::string toString() const override {
+        return "start..end";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Range; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Range;
+    }
 };
-
-// --- Schema Definition ---
 
 struct RecordField {
     std::string name;
     Type type;
-    // [NEW] Default value for Singleton fields (e.g. port: i32 = 8080)
-    std::unique_ptr<Expr> defaultValue; 
+
+    // Optional default value, used especially by singleton-style schemas.
+    std::unique_ptr<Expr> defaultValue;
 };
 
 struct EnumVariant {
     std::string name;
-    enum Kind { Unit, Tuple, Struct } kind;
-    std::vector<Type> tuplePayload;                 
-    std::vector<RecordField> structPayload; 
+
+    enum Kind {
+        Unit,
+        Tuple,
+        Struct
+    } kind = Unit;
+
+    std::vector<Type> tuplePayload;
+    std::vector<RecordField> structPayload;
 };
 
 struct SchemaDecl : public Decl {
-    enum Kind { Record, Enum };
-    
+    enum Kind {
+        Record,
+        Enum
+    };
+
     Kind kind;
     std::string name;
-    bool hasMeta;
-    
-    // [NEW] Singleton Flag
+    bool hasMeta = false;
     bool isSingleton = false;
-
-    // [NEW] Generic Parameters (e.g. "T" in struct Box<T>)
     std::vector<std::string> genericParams;
-
-    std::vector<RecordField> fields;    
-    std::vector<EnumVariant> variants;  
+    std::vector<RecordField> fields;
+    std::vector<EnumVariant> variants;
     SourceLoc loc;
 
-    // Struct Ctor
     SchemaDecl(std::string n, std::vector<RecordField> f, SourceLoc l, bool meta)
-        : kind(Record), name(std::move(n)), hasMeta(meta), fields(std::move(f)), loc(std::move(l)) {}
+        : kind(Record),
+          name(std::move(n)),
+          hasMeta(meta),
+          fields(std::move(f)),
+          loc(std::move(l)) {}
 
-    // Enum Ctor
     SchemaDecl(std::string n, std::vector<EnumVariant> v, SourceLoc l, bool meta)
-        : kind(Enum), name(std::move(n)), hasMeta(meta), variants(std::move(v)), loc(std::move(l)) {}
+        : kind(Enum),
+          name(std::move(n)),
+          hasMeta(meta),
+          variants(std::move(v)),
+          loc(std::move(l)) {}
 };
-
-// --- Schema Usage ---
 
 struct SchemaInitField {
     std::string name;
@@ -862,60 +1204,71 @@ struct SchemaInitField {
 
 struct SchemaExpr : public Expr {
     std::string name;
-    std::vector<Type> genericArgs; // [NEW] Stores <i32>
+    std::vector<Type> genericArgs;
     std::vector<SchemaInitField> fields;
-    
-    // Update Constructor
+
     SchemaExpr(SourceLoc l, std::string n, std::vector<Type> args, std::vector<SchemaInitField> f)
-        : Expr(ExprKind::SchemaExpr, l), name(std::move(n)), genericArgs(std::move(args)), fields(std::move(f)) {}
+        : Expr(ExprKind::SchemaExpr, l),
+          name(std::move(n)),
+          genericArgs(std::move(args)),
+          fields(std::move(f)) {}
 
-    std::string toString() const override { return name + "{...}"; }
+    std::string toString() const override {
+        return name + "{...}";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::SchemaExpr; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::SchemaExpr;
+    }
 };
 
 struct MemberExpr : public Expr {
     std::unique_ptr<Expr> object;
     std::string member;
-    
+
     MemberExpr(SourceLoc l, std::unique_ptr<Expr> obj, std::string mem)
-        : Expr(ExprKind::MemberAccess, l), object(std::move(obj)), member(std::move(mem)) {}
-    
-    std::string toString() const override { 
-        return object->toString() + "." + member; 
+        : Expr(ExprKind::MemberAccess, l),
+          object(std::move(obj)),
+          member(std::move(mem)) {}
+
+    std::string toString() const override {
+        return (object ? object->toString() : std::string("<null>")) + "." + member;
     }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::MemberAccess; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::MemberAccess;
+    }
 };
 
 struct MemberCallNode : public Expr {
     std::unique_ptr<Expr> object;
     std::string methodName;
-    std::vector<CallArg> args; 
+    std::vector<CallArg> args;
 
     MemberCallNode(SourceLoc l, std::unique_ptr<Expr> obj, std::string method, std::vector<CallArg> a)
-        : Expr(ExprKind::MemberCall, l), object(std::move(obj)), methodName(std::move(method)), args(std::move(a)) {}
+        : Expr(ExprKind::MemberCall, l),
+          object(std::move(obj)),
+          methodName(std::move(method)),
+          args(std::move(a)) {}
 
-    std::string toString() const override { 
-        return object->toString() + "." + methodName + "(...)"; 
+    std::string toString() const override {
+        return (object ? object->toString() : std::string("<null>")) + "." + methodName + "(...)";
     }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::MemberCall; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::MemberCall;
+    }
 };
 
-
-// -----------------------------------------------------------------------------
-// Pattern Matching
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 13. Pattern Matching
+// =============================================================================
 
 struct Pattern {
-    std::string schemaName;   // "Event"
-    std::string variantName;  // "Click"
-    std::vector<std::string> bindings; // ["x", "y"]
-    bool isDefault = false;   // true for "default =>"
+    std::string schemaName;
+    std::string variantName;
+    std::vector<std::string> bindings;
+    bool isDefault = false;
 };
 
 struct Case {
@@ -927,55 +1280,59 @@ struct MatchStmt : public Expr {
     std::unique_ptr<Expr> target;
     std::vector<Case> cases;
 
-    MatchStmt(SourceLoc loc, std::unique_ptr<Expr> target, std::vector<Case> cases)
-        : Expr(ExprKind::Match, loc), target(std::move(target)), cases(std::move(cases)) {}
+    MatchStmt(SourceLoc l, std::unique_ptr<Expr> t, std::vector<Case> c)
+        : Expr(ExprKind::Match, l), target(std::move(t)), cases(std::move(c)) {}
 
-    std::string toString() const override { return "match"; }
+    std::string toString() const override {
+        return "match";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Match; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Match;
+    }
 };
 
 struct PrintStmt : public Expr {
     std::vector<std::unique_ptr<Expr>> values;
-    PrintStmt(SourceLoc l, std::vector<std::unique_ptr<Expr>> v) 
+
+    PrintStmt(SourceLoc l, std::vector<std::unique_ptr<Expr>> v)
         : Expr(ExprKind::Print, l), values(std::move(v)) {}
 
-    std::string toString() const override { return "print"; }
+    std::string toString() const override {
+        return "print";
+    }
 
-    // [FIX] Required for llvm::dyn_cast
-    static bool classof(const Expr *e) { return e->kind == ExprKind::Print; }
+    static bool classof(const Expr* e) {
+        return e->kind == ExprKind::Print;
+    }
 };
 
-// -----------------------------------------------------------------------------
-// Top Level Structures
-// -----------------------------------------------------------------------------
+// =============================================================================
+// 14. Top-Level Structures
+// =============================================================================
 
 struct Function : public Decl {
     std::string name;
-    Domain domain;
-    uint32_t effects; // Bitmask (IO | NET | FS)
+    Domain domain = Domain::Host;
+    uint32_t effects = 0;
     SourceLoc loc;
-    
-    std::vector<std::pair<std::string, Type>> args; 
+
+    // Ordered parameter list: (name, type)
+    std::vector<std::pair<std::string, Type>> args;
+
     Type returnType;
     std::vector<std::unique_ptr<Expr>> body;
 };
 
 struct Module {
-    // [NEW] Unique Identifier for the module (usually the filename stem)
-    // Used for name mangling (e.g. "vectors" -> @vectors_add)
+    // Stable identifier, typically derived from file stem.
     std::string id;
 
-    // List of imports: import "math" as m;
     std::vector<std::unique_ptr<ImportDecl>> imports;
-    
-    // Top-level definitions
     std::vector<std::unique_ptr<Function>> functions;
-    std::vector<std::unique_ptr<SchemaDecl>> schemas; 
-    
-    // Maps submodule names (e.g. "vec") to loaded Module pointers
-    // This allows CodeGen to resolve "math.vec.add" recursively.
+    std::vector<std::unique_ptr<SchemaDecl>> schemas;
+
+    // Non-owning submodule links used by later passes for qualified resolution.
     llvm::StringMap<Module*> submodules;
 };
 

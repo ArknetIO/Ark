@@ -5849,4 +5849,4 @@ mlir::FailureOr<RValue> GenMIR::lowerExpr(const Expr &expr) {
 }
 
 
-} // namespace arklang1
+} // namespace arklang

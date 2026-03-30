@@ -22,9 +22,10 @@ enum class TokenType {
     KwPub,
     KwImport,
 
-    // --- Keywords: Execution Domains / Memory ---
+    // --- Keywords: Execution, Memory & Runtime ---
     KwGpu, KwHost, KwRam, KwCpu,
     KwAllocof,
+    KwRuntime,
 
     // --- Keywords: Async & Concurrency ---
     KwLaunch, KwAwait, KwAs,
@@ -52,7 +53,7 @@ enum class TokenType {
     KwCase,
     KwDefault,
 
-    // --- Keywords: Data Modeling / Misc ---
+    // --- Keywords: Data Modeling & Builtins ---
     KwSchema,
     KwMeta,
     KwPrint,
@@ -65,7 +66,7 @@ enum class TokenType {
     String,
     Char,
 
-    // --- Delimiters / Punctuation ---
+    // --- Delimiters & Punctuation ---
     LParen, RParen,
     LBrace, RBrace,
     LBracket, RBracket,
@@ -74,25 +75,25 @@ enum class TokenType {
     Semicolon,
     Comma,
     Dot,
-    Range,      // ..
+    Range,
     DotDot = Range,
 
-    // --- Assignment / Arrows / Misc ---
-    Equal,      // =
-    Arrow,      // ->
-    FatArrow,   // =>
-    ArrowL,     // <-
-    At,         // @
-    Question,   // ?
+    // --- Assignment, Arrows & Misc ---
+    Equal,
+    Arrow,
+    FatArrow,
+    ArrowL,
+    At,
+    Question,
 
     // --- Arithmetic Operators ---
-    Plus, Minus, Star, Slash, Percent, // + - * / %
+    Plus, Minus, Star, Slash, Percent,
 
     // --- Bitwise Operators ---
     Amp, Pipe, Caret, Tilde,
     Shl, Shr,
 
-    // --- Logical / Comparison ---
+    // --- Logical & Comparison Operators ---
     Less, Greater, Not,
     EqualEqual,
     BangEqual,
@@ -101,7 +102,7 @@ enum class TokenType {
     AmpAmp,
     PipePipe,
 
-    // --- Compound Assignments ---
+    // --- Compound Assignment Operators ---
     PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
 
     // --- Control ---

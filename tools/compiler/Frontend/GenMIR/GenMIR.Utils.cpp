@@ -26,7 +26,7 @@ mlir::Value getOrCreateGlobalString(mlir::Location loc,
                                     mlir::OpBuilder &funcBuilder,
                                     mlir::ModuleOp module,
                                     llvm::StringRef content) {
-    auto *ctx = funcBuilder.getContext();
+    auto* ctx = funcBuilder.getContext();
     std::string name = ".str." + std::to_string(llvm::hash_value(content));
 
     if (!module.lookupSymbol<mlir::LLVM::GlobalOp>(name)) {
@@ -74,7 +74,7 @@ mlir::Value getOrCreateGlobalString(mlir::Location loc,
 }
 
 // Helper: Create a boolean constant (i1)
-mlir::Value constBool(mlir::OpBuilder &builder, mlir::Location loc, bool val) {
+mlir::Value constBool(mlir::OpBuilder& builder, mlir::Location loc, bool val) {
     return builder.create<mlir::LLVM::ConstantOp>(
         loc,
         builder.getI1Type(),
@@ -82,7 +82,7 @@ mlir::Value constBool(mlir::OpBuilder &builder, mlir::Location loc, bool val) {
     );
 }
 
-mlir::LLVM::LLVMFuncOp getOrDeclPrintf(mlir::ModuleOp module, mlir::OpBuilder &builder) {
+mlir::LLVM::LLVMFuncOp getOrDeclPrintf(mlir::ModuleOp module, mlir::OpBuilder& builder) {
     if (auto fn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("printf")) {
         return fn;
     }
@@ -97,7 +97,7 @@ mlir::LLVM::LLVMFuncOp getOrDeclPrintf(mlir::ModuleOp module, mlir::OpBuilder &b
 }
 
 // Helper to emit a printf call
-void emitPrintf(mlir::OpBuilder &b,
+void emitPrintf(mlir::OpBuilder& b,
                 mlir::Location loc,
                 mlir::ModuleOp mod,
                 llvm::StringRef fmt,
@@ -119,7 +119,7 @@ void emitPrintf(mlir::OpBuilder &b,
 // Signature: i64 __ark_launch(ptr grid, ptr kernel, i64 uid_lo, i64 uid_hi, ptr args, i64 size, i64 dim, ptr config)
 // =============================================================================
 mlir::LLVM::LLVMFuncOp getOrDeclareArkLaunch(mlir::ModuleOp module,
-                                             mlir::OpBuilder &builder,
+                                             mlir::OpBuilder& builder,
                                              mlir::Location loc) {
     if (auto fn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("__ark_launch")) {
         return fn;
@@ -128,7 +128,7 @@ mlir::LLVM::LLVMFuncOp getOrDeclareArkLaunch(mlir::ModuleOp module,
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(module.getBody());
 
-    auto *ctx = builder.getContext();
+    auto* ctx = builder.getContext();
     auto voidPtrTy = mlir::LLVM::LLVMPointerType::get(ctx);
     auto i64Ty = builder.getI64Type();
 
@@ -137,6 +137,7 @@ mlir::LLVM::LLVMFuncOp getOrDeclareArkLaunch(mlir::ModuleOp module,
         {
             voidPtrTy,
             voidPtrTy,
+            i64Ty,
             i64Ty,
             i64Ty,
             voidPtrTy,
@@ -154,6 +155,7 @@ mlir::LLVM::LLVMFuncOp getOrDeclareArkLaunch(mlir::ModuleOp module,
         mlir::LLVM::Linkage::External
     );
 }
+
 
 llvm::StringRef normalizeIntrinsicName(llvm::StringRef raw) {
     llvm::StringRef s = raw;
@@ -173,20 +175,34 @@ llvm::StringRef normalizeIntrinsicName(llvm::StringRef raw) {
             return b;
         }
     }
+
     return s;
 }
 
+// Helper: Check whether an intrinsic is allowed inside GPU codegen.
 bool isGpuSafeIntrinsic(llvm::StringRef rawName) {
-    llvm::StringRef name = normalizeIntrinsicName(rawName);
-    return llvm::StringSwitch<bool>(name)
-        .Cases("len", "dims", "sizeof", "castof", "hash", "shash", "stable_hash", true)
-        .Cases("sin", "cos", "max", "min", true)
-        .Cases("atomic_add", "atomic_sub", true)
-        .Cases("thread_id_x", "block_id_x", true)
-        .Default(false);
+    const llvm::StringRef name = normalizeIntrinsicName(rawName);
+
+    return
+        name == "len" ||
+        name == "dims" ||
+        name == "sizeof" ||
+        name == "castof" ||
+        name == "hash" ||
+        name == "shash" ||
+        name == "stable_hash" ||
+        name == "sin" ||
+        name == "cos" ||
+        name == "max" ||
+        name == "min" ||
+        name == "atomic_add" ||
+        name == "atomic_sub" ||
+        name == "thread_id_x" ||
+        name == "block_id_x";
 }
 
-mlir::LogicalResult mangleTypeRecursive(mlir::Type t, llvm::raw_ostream &os) {
+
+mlir::LogicalResult mangleTypeRecursive(mlir::Type t, llvm::raw_ostream& os) {
     if (auto i = llvm::dyn_cast<mlir::IntegerType>(t)) {
         os << "i" << i.getWidth();
         return mlir::success();
@@ -242,13 +258,13 @@ mlir::FailureOr<std::string> mangleCanonicalType(mlir::Type t) {
 }
 
 // Helper: Recursively scan for forbidden Return statements in GPU regions
-bool containsReturn(const Expr &e) {
+bool containsReturn(const Expr& e) {
     if (e.kind == ExprKind::Return) {
         return true;
     }
 
-    if (auto *b = dynamic_cast<const BlockExpr *>(&e)) {
-        for (const auto &s : b->stmts) {
+    if (auto* b = dynamic_cast<const BlockExpr*>(&e)) {
+        for (const auto& s : b->stmts) {
             if (containsReturn(*s)) {
                 return true;
             }
@@ -256,7 +272,7 @@ bool containsReturn(const Expr &e) {
         return false;
     }
 
-    if (auto *ifStmt = dynamic_cast<const IfStmt *>(&e)) {
+    if (auto* ifStmt = dynamic_cast<const IfStmt*>(&e)) {
         if (containsReturn(*ifStmt->condition)) {
             return true;
         }
@@ -269,11 +285,11 @@ bool containsReturn(const Expr &e) {
         return false;
     }
 
-    if (auto *matchStmt = dynamic_cast<const MatchStmt *>(&e)) {
+    if (auto* matchStmt = dynamic_cast<const MatchStmt*>(&e)) {
         if (containsReturn(*matchStmt->target)) {
             return true;
         }
-        for (const auto &c : matchStmt->cases) {
+        for (const auto& c : matchStmt->cases) {
             if (c.body && containsReturn(*c.body)) {
                 return true;
             }
@@ -281,32 +297,32 @@ bool containsReturn(const Expr &e) {
         return false;
     }
 
-    if (auto *w = dynamic_cast<const WhileStmt *>(&e)) {
+    if (auto* w = dynamic_cast<const WhileStmt*>(&e)) {
         return containsReturn(*w->body);
     }
-    if (auto *f = dynamic_cast<const ForStmt *>(&e)) {
+    if (auto* f = dynamic_cast<const ForStmt*>(&e)) {
         return containsReturn(*f->body);
     }
-    if (auto *p = dynamic_cast<const ParLoop *>(&e)) {
+    if (auto* p = dynamic_cast<const ParLoop*>(&e)) {
         return containsReturn(*p->body);
     }
 
-    if (auto *bin = dynamic_cast<const BinaryExpr *>(&e)) {
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
         return containsReturn(*bin->lhs) || containsReturn(*bin->rhs);
     }
-    if (auto *call = dynamic_cast<const CallExpr *>(&e)) {
-        for (const auto &arg : call->args) {
+    if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
+        for (const auto& arg : call->args) {
             if (containsReturn(*arg.value)) {
                 return true;
             }
         }
         return false;
     }
-    if (auto *assign = dynamic_cast<const AssignStmt *>(&e)) {
+    if (auto* assign = dynamic_cast<const AssignStmt*>(&e)) {
         return containsReturn(*assign->target) || containsReturn(*assign->value);
     }
 
-    if (dynamic_cast<const LambdaExpr *>(&e)) {
+    if (dynamic_cast<const LambdaExpr*>(&e)) {
         return false;
     }
 
@@ -314,7 +330,7 @@ bool containsReturn(const Expr &e) {
 }
 
 mlir::LLVM::LLVMFuncOp getOrDeclareArkGpuLaunch(mlir::ModuleOp module,
-                                                mlir::OpBuilder &builder,
+                                                mlir::OpBuilder& builder,
                                                 mlir::Location loc) {
     if (auto fn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("__ark_gpu_launch")) {
         return fn;
@@ -349,7 +365,7 @@ mlir::LLVM::LLVMFuncOp getOrDeclareArkGpuLaunch(mlir::ModuleOp module,
 }
 
 // Helper: Robust Pointer Casting (Address Space Aware)
-mlir::Value castPtrTo(mlir::OpBuilder &b,
+mlir::Value castPtrTo(mlir::OpBuilder& b,
                       mlir::Location loc,
                       mlir::Value ptr,
                       mlir::Type expectedPtrTy) {
@@ -375,7 +391,7 @@ mlir::Value castPtrTo(mlir::OpBuilder &b,
 }
 
 // Helper: Cast any pointer to the expected runtime pointer type (handling AddrSpace)
-mlir::Value castToExpectedPtr(mlir::OpBuilder &b,
+mlir::Value castToExpectedPtr(mlir::OpBuilder& b,
                               mlir::Location loc,
                               mlir::Value v,
                               mlir::Type expectedPtrTy) {
@@ -395,30 +411,30 @@ mlir::Value castToExpectedPtr(mlir::OpBuilder &b,
 }
 
 // Helper: Canonical Unit Type
-mlir::Type getUnitType(mlir::OpBuilder &b) {
+mlir::Type getUnitType(mlir::OpBuilder& b) {
     return mlir::LLVM::LLVMStructType::getLiteral(b.getContext(), {});
 }
 
 // Helper: Canonical Unit Value (Undef)
-mlir::Value getUnitUndef(mlir::OpBuilder &b, mlir::Location loc) {
+mlir::Value getUnitUndef(mlir::OpBuilder& b, mlir::Location loc) {
     return b.create<mlir::LLVM::UndefOp>(loc, getUnitType(b));
 }
 
-bool isTensorType(const arklang::Type &ty) {
+bool isTensorType(const arklang::Type& ty) {
     return (ty.kind == arklang::Type::Tensor) ||
            (ty.kind == arklang::Type::Generic && ty.schemaName == "Alloc");
 }
 
 // Safely splits a block for control flow insertion.
-mlir::FailureOr<mlir::Block *> splitBlockAt(mlir::OpBuilder &b,
-                                            mlir::Location loc,
-                                            mlir::Block *cur) {
+mlir::FailureOr<mlir::Block*> splitBlockAt(mlir::OpBuilder& b,
+                                           mlir::Location loc,
+                                           mlir::Block* cur) {
     if (b.getInsertionBlock() != cur) {
         return mlir::emitError(loc, "Internal: Builder insertion block mismatch in splitBlockAt");
     }
 
     mlir::Block::iterator ip = b.getInsertionPoint();
-    mlir::Operation *term = cur->getTerminator();
+    mlir::Operation* term = cur->getTerminator();
 
     if (term) {
         if (term->getNextNode() != nullptr) {
@@ -431,7 +447,7 @@ mlir::FailureOr<mlir::Block *> splitBlockAt(mlir::OpBuilder &b,
         if (ip == cur->end()) {
             ip = term->getIterator();
         } else {
-            mlir::Operation *op = &*ip;
+            mlir::Operation* op = &*ip;
             if (op != term && term->isBeforeInBlock(op)) {
                 return mlir::emitError(loc, "Internal: Insertion point is physically past the terminator");
             }
@@ -442,7 +458,7 @@ mlir::FailureOr<mlir::Block *> splitBlockAt(mlir::OpBuilder &b,
     }
 
     if (ip == cur->end()) {
-        mlir::Region *region = cur->getParent();
+        mlir::Region* region = cur->getParent();
         return b.createBlock(region, std::next(cur->getIterator()));
     }
 
@@ -450,7 +466,7 @@ mlir::FailureOr<mlir::Block *> splitBlockAt(mlir::OpBuilder &b,
 }
 
 mlir::LLVM::LLVMFuncOp getOrDeclRuntimeFn(mlir::ModuleOp module,
-                                          mlir::OpBuilder &b,
+                                          mlir::OpBuilder& b,
                                           mlir::Location loc,
                                           llvm::StringRef name,
                                           mlir::Type retTy,
@@ -466,7 +482,7 @@ mlir::LLVM::LLVMFuncOp getOrDeclRuntimeFn(mlir::ModuleOp module,
     return b.create<mlir::LLVM::LLVMFuncOp>(loc, name, fnTy);
 }
 
-std::string astTypeToString(const arklang::Type &t) {
+std::string astTypeToString(const arklang::Type& t) {
     switch (t.kind) {
         case arklang::Type::I32: return "i32";
         case arklang::Type::F32: return "f32";
@@ -478,8 +494,8 @@ std::string astTypeToString(const arklang::Type &t) {
     }
 }
 
-arklang::Type substituteTypeParams(const arklang::Type &src,
-                                   const llvm::StringMap<arklang::Type> &subst) {
+arklang::Type substituteTypeParams(const arklang::Type& src,
+                                   const llvm::StringMap<arklang::Type>& subst) {
     arklang::Type out = src;
 
     if (out.kind == arklang::Type::Schema) {
@@ -490,19 +506,19 @@ arklang::Type substituteTypeParams(const arklang::Type &src,
     }
 
     if (!out.genericArgs.empty()) {
-        for (auto &arg : out.genericArgs) {
+        for (auto& arg : out.genericArgs) {
             arg = substituteTypeParams(arg, subst);
         }
     }
 
     if (out.kind == arklang::Type::Tuple) {
-        for (auto &sub : out.subtypes) {
+        for (auto& sub : out.subtypes) {
             sub = substituteTypeParams(sub, subst);
         }
     }
 
     if (out.kind == arklang::Type::Func) {
-        for (auto &param : out.paramTypes) {
+        for (auto& param : out.paramTypes) {
             param = substituteTypeParams(param, subst);
         }
         if (out.funcReturnType) {
@@ -516,7 +532,7 @@ arklang::Type substituteTypeParams(const arklang::Type &src,
 std::string mangleGenericName(llvm::StringRef baseName,
                               llvm::ArrayRef<arklang::Type> args);
 
-std::string mangleArg(const arklang::Type &t) {
+std::string mangleArg(const arklang::Type& t) {
     switch (t.kind) {
         case arklang::Type::I8: return "i8";
         case arklang::Type::I16: return "i16";
@@ -540,7 +556,7 @@ std::string mangleArg(const arklang::Type &t) {
             return "tensor_" + (t.genericArgs.empty() ? "void" : mangleArg(t.genericArgs[0]));
         case arklang::Type::Tuple: {
             std::string out = "t";
-            for (auto &s : t.subtypes) {
+            for (auto& s : t.subtypes) {
                 out += "_";
                 out += mangleArg(s);
             }
@@ -557,8 +573,9 @@ std::string mangleGenericName(llvm::StringRef baseName,
     if (args.empty()) {
         return baseName.str();
     }
+
     std::string out = baseName.str();
-    for (const auto &a : args) {
+    for (const auto& a : args) {
         out += "_";
         out += mangleArg(a);
     }

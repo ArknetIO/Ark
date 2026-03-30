@@ -70,15 +70,18 @@
 #include <system_error>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <unistd.h>
-extern "C" { extern char** environ; }
-#else
-#include <io.h>
-#endif
-
 #ifndef ARK_VERSION_STRING
   #define ARK_VERSION_STRING "dev"
+#endif
+
+
+#if !defined(_WIN32)
+#include <unistd.h>
+extern "C" {
+    extern char** environ;
+}
+#else
+#include <io.h>
 #endif
 
 namespace ark::cli {
@@ -220,29 +223,34 @@ static void bestEffortAuditFatbinExport(arklang::hud::Hud& hud, llvm::StringRef 
 }
 
 static std::optional<llvm::ArrayRef<llvm::StringRef>>
-buildInheritedEnv(llvm::SmallVectorImpl<std::string>& storage, llvm::SmallVectorImpl<llvm::StringRef>& refs) {
-#if defined(_WIN32)
-    return std::nullopt;
-#else
+buildInheritedEnv(llvm::SmallVectorImpl<std::string>& storage,
+                  llvm::SmallVectorImpl<llvm::StringRef>& refs) {
     storage.clear();
     refs.clear();
 
-    if (!::environ) return std::nullopt;
-    for (char** e = ::environ; *e != nullptr; ++e) storage.emplace_back(*e);
+#if defined(_WIN32)
+    char*** penv = __p__environ();
+    if (!penv || !*penv) return std::nullopt;
 
-    void* mainAddr = reinterpret_cast<void*>(reinterpret_cast<std::intptr_t>(resolveRuntimePath));
-    auto myExe = llvm::sys::fs::getMainExecutable(nullptr, mainAddr);
-    llvm::SmallString<256> myExeDir = llvm::sys::path::parent_path(myExe);
-    llvm::sys::path::append(myExeDir, "lib");
-    storage.push_back("ARK_GPU_PLUGIN_DIR=" + std::string(myExeDir.str()));
+    for (char** e = *penv; *e != nullptr; ++e) {
+        storage.emplace_back(*e);
+    }
+#else
+    if (!::environ) return std::nullopt;
+
+    for (char** e = ::environ; *e != nullptr; ++e) {
+        storage.emplace_back(*e);
+    }
+#endif
+    
 
     refs.reserve(storage.size());
-    for (auto& s : storage) refs.push_back(s);
+    for (auto& s : storage) {
+        refs.push_back(s);
+    }
 
     return llvm::ArrayRef<llvm::StringRef>(refs);
-#endif
 }
-
 static std::optional<std::string> getenvStr(const char* name) {
     const char* v = std::getenv(name);
     if (!v) return std::nullopt;

@@ -8,6 +8,23 @@
 #include <cstdio>
 #include <cstdlib>
 
+
+namespace {
+
+static std::string stripQuotedToken(llvm::StringRef text) {
+    std::string s = text.str();
+    if (s.size() >= 2) {
+        const char first = s.front();
+        const char last = s.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            return s.substr(1, s.size() - 2);
+        }
+    }
+    return s;
+}
+
+} // namespace
+
 namespace arklang {
 
 // -----------------------------------------------------------------------------
@@ -294,56 +311,69 @@ std::unique_ptr<Function> Parser::parseFunction() {
 // Statements
 // -----------------------------------------------------------------------------
 
-std::unique_ptr<Expr> Parser::parseStmt() {
-    // 1. Statements that don't require trailing semicolons
-    if (match(TokenType::KwLet))    return parseLet();
-    if (match(TokenType::KwReturn)) return parseReturn();
-    if (match(TokenType::KwPar))    return parseParLoop();
-    
-    // Control Flow (Statement Form)
-    if (match(TokenType::KwIf))     return parseIf();
-    if (match(TokenType::KwWhile))  return parseWhile();
-    if (match(TokenType::KwFor))    return parseFor();
-    if (match(TokenType::KwIter))   return parseIter();
-    if (match(TokenType::KwMatch))  return parseMatch();
-    
-    // Debug
-    if (match(TokenType::KwPrint))  return parsePrint();
-    
-    // Block Statement
-    if (check(TokenType::LBrace))   return parseBlock();
 
-    // 2. Expression Statements (Require Semicolons)
-    // We parse the expression first. It might be a function call, 
-    // or the Left-Hand Side (LHS) of an assignment.
+// =============================================================================
+// Statement Parsing
+// Adds support for:
+// - break;
+// - continue;
+// while preserving the existing statement/expression split.
+// =============================================================================
+std::unique_ptr<Expr> Parser::parseStmt() {
+    if (match(TokenType::KwLet))      return parseLet();
+    if (match(TokenType::KwReturn))   return parseReturn();
+    if (match(TokenType::KwPar))      return parseParLoop();
+    if (match(TokenType::KwIf))       return parseIf();
+    if (match(TokenType::KwWhile))    return parseWhile();
+    if (match(TokenType::KwFor))      return parseFor();
+    if (match(TokenType::KwIter))     return parseIter();
+    if (match(TokenType::KwMatch))    return parseMatch();
+    if (match(TokenType::KwPrint))    return parsePrint();
+
+    if (match(TokenType::KwBreak)) {
+        SourceLoc loc = previous().loc;
+        consume(TokenType::Semicolon, "Expected ';' after break");
+        return std::make_unique<BreakStmt>(loc);
+    }
+
+    if (match(TokenType::KwContinue)) {
+        SourceLoc loc = previous().loc;
+        consume(TokenType::Semicolon, "Expected ';' after continue");
+        return std::make_unique<ContinueStmt>(loc);
+    }
+
+    if (check(TokenType::LBrace)) {
+        return parseBlock();
+    }
+
     std::unique_ptr<Expr> expr = parseExpr();
-    
-    // 3. Assignment Handling (LHS = RHS)
+
     if (match(TokenType::Equal)) {
         SourceLoc eqLoc = previous().loc;
         std::unique_ptr<Expr> val = parseExpr();
-        
-        // Validate L-Value: Can we assign to this expression?
-        // Valid targets: Symbols (x), Indexing (arr[i]), Member Access (obj.prop)
-        bool isLValue = (expr->kind == ExprKind::Symbol || 
-                         expr->kind == ExprKind::Index || 
-                         expr->kind == ExprKind::MemberAccess);
+
+        const bool isLValue =
+            expr &&
+            (expr->kind == ExprKind::Symbol ||
+             expr->kind == ExprKind::Index ||
+             expr->kind == ExprKind::MemberAccess);
 
         if (isLValue) {
-            // [FIXED] Use generic AssignStmt constructor taking (Target, Value)
             auto assign = std::make_unique<AssignStmt>(eqLoc, std::move(expr), std::move(val));
             consume(TokenType::Semicolon, "Expected ';' after assignment");
             return assign;
-        } else {
-            errorAt(eqLoc, "Invalid assignment target. Only variables, fields, and indices can be assigned.");
-            // Error recovery: return the LHS so parsing can continue without crashing
-            return expr; 
         }
+
+        errorAt(eqLoc, "Invalid assignment target. Only variables, fields, and indices can be assigned.");
+        consume(TokenType::Semicolon, "Expected ';' after invalid assignment");
+        return expr;
     }
-    
+
     consume(TokenType::Semicolon, "Expected ';' after expression statement");
     return expr;
 }
+
+
 
 std::unique_ptr<Expr> Parser::parsePrint() {
     SourceLoc loc = previous().loc;
@@ -734,62 +764,214 @@ std::unique_ptr<Expr> Parser::parseMatch() {
     return std::make_unique<MatchStmt>(loc, std::move(target), std::move(cases));
 }
 
-std::unique_ptr<Expr> Parser::parseLaunch() {
+
+std::unique_ptr<Expr> Parser::parseEquality() {
     std::unique_ptr<Expr> lhs = parseComparison();
-    if (match(TokenType::ArrowL)) {
+
+    while (match(TokenType::EqualEqual) || match(TokenType::BangEqual)) {
         SourceLoc loc = previous().loc;
-        if (lhs->kind != ExprKind::Symbol) {
-            errorAt(loc, "Launch destination must be a variable symbol");
-            return lhs;
-        }
-        std::string dest = static_cast<SymbolExpr*>(lhs.get())->name;
-        std::string kernel = consume(TokenType::Identifier, "Expected kernel name").text.str();
-        auto args = parseArgumentList(); 
-        std::string token = "";
-        if (match(TokenType::KwAs)) {
-            token = consume(TokenType::Identifier, "Expected token name").text.str();
-        }
-        return std::make_unique<LaunchExpr>(loc, dest, kernel, std::move(args), token);
+        std::string op = previous().text.str();
+        std::unique_ptr<Expr> rhs = parseComparison();
+        lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
     }
+
     return lhs;
 }
 
+std::unique_ptr<Expr> Parser::parseLogicAnd() {
+    std::unique_ptr<Expr> lhs = parseEquality();
+
+    while (match(TokenType::AmpAmp)) {
+        SourceLoc loc = previous().loc;
+        std::string op = previous().text.str();
+        std::unique_ptr<Expr> rhs = parseEquality();
+        lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
+    }
+
+    return lhs;
+}
+
+std::unique_ptr<Expr> Parser::parseLogicOr() {
+    std::unique_ptr<Expr> lhs = parseLogicAnd();
+
+    while (match(TokenType::PipePipe)) {
+        SourceLoc loc = previous().loc;
+        std::string op = previous().text.str();
+        std::unique_ptr<Expr> rhs = parseLogicAnd();
+        lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
+    }
+
+    return lhs;
+}
+
+
+
+std::unique_ptr<Expr> Parser::parseLaunch() {
+    std::unique_ptr<Expr> lhs = parseLogicOr();
+
+    if (!match(TokenType::ArrowL)) {
+        return lhs;
+    }
+
+    SourceLoc loc = previous().loc;
+
+    if (!lhs || lhs->kind != ExprKind::Symbol) {
+        errorAt(loc, "Launch destination must be a variable symbol");
+        return lhs;
+    }
+
+    std::string dest = static_cast<SymbolExpr*>(lhs.get())->name;
+
+    std::string kernel = consume(TokenType::Identifier, "Expected kernel name").text.str();
+    while (match(TokenType::Dot)) {
+        kernel += ".";
+        kernel += consume(TokenType::Identifier, "Expected identifier after '.' in kernel name").text.str();
+    }
+
+    auto args = parseArgumentList();
+
+    std::string tokenName;
+    if (match(TokenType::KwAs)) {
+        tokenName = consume(TokenType::Identifier, "Expected token name after 'as'").text.str();
+    }
+
+    if (match(TokenType::At)) {
+        consume(TokenType::KwRuntime, "Expected 'runtime' after '@' in launch annotation");
+        std::string presetName = consume(TokenType::Identifier, "Expected runtime preset name after '@runtime'").text.str();
+        return std::make_unique<LaunchExpr>(
+            loc,
+            dest,
+            kernel,
+            std::move(args),
+            tokenName,
+            Space::runtimePreset(presetName)
+        );
+    }
+
+    return std::make_unique<LaunchExpr>(loc, dest, kernel, std::move(args), tokenName);
+}
+
+
+
 std::unique_ptr<Expr> Parser::parseComparison() {
     std::unique_ptr<Expr> lhs = parseTerm();
-    while (match(TokenType::Less) || match(TokenType::Greater) ||
-           match(TokenType::LessEqual) || match(TokenType::GreaterEqual) ||
-           match(TokenType::EqualEqual) || match(TokenType::BangEqual)) {
-        std::string op = previous().text.str();
+
+    while (match(TokenType::Less) ||
+           match(TokenType::Greater) ||
+           match(TokenType::LessEqual) ||
+           match(TokenType::GreaterEqual)) {
         SourceLoc loc = previous().loc;
+        std::string op = previous().text.str();
         std::unique_ptr<Expr> rhs = parseTerm();
         lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
     }
+
     return lhs;
 }
 
 std::unique_ptr<Expr> Parser::parseTerm() {
     std::unique_ptr<Expr> lhs = parseFactor();
+
     while (match(TokenType::Plus) || match(TokenType::Minus)) {
-        std::string op = previous().text.str();
         SourceLoc loc = previous().loc;
+        std::string op = previous().text.str();
         std::unique_ptr<Expr> rhs = parseFactor();
         lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
     }
+
     return lhs;
 }
 
-std::unique_ptr<Expr> Parser::parseFactor() {
-    std::unique_ptr<Expr> lhs = parsePrimary();
+std::unique_ptr<Expr> Parser::parseUnary() {
+    if (match(TokenType::Not) || match(TokenType::Minus) || match(TokenType::Plus)) {
+        SourceLoc loc = previous().loc;
+        std::string op = previous().text.str();
+        std::unique_ptr<Expr> operand = parseUnary();
+        return std::make_unique<UnaryExpr>(loc, op, std::move(operand));
+    }
+
+    return parseCall();
+}
+
+
+std::unique_ptr<Expr> Parser::parseCall() {
+    std::unique_ptr<Expr> expr = parsePrimary();
 
     while (true) {
-        if (match(TokenType::Star) || match(TokenType::Slash) || match(TokenType::Percent)) {
-            std::string op = previous().text.str();
-            SourceLoc loc = previous().loc;
-            std::unique_ptr<Expr> rhs = parsePrimary();
-            lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
+        if (check(TokenType::LParen)) {
+            SourceLoc loc = expr ? expr->loc : peek().loc;
+            auto args = parseArgumentList();
+            expr = std::make_unique<CallExpr>(loc, std::move(expr), std::move(args));
             continue;
         }
+
+        if (match(TokenType::LBracket)) {
+            SourceLoc loc = previous().loc;
+            std::unique_ptr<Expr> index = parseExpr();
+            consume(TokenType::RBracket, "Expected ']' after index expression");
+            expr = std::make_unique<IndexExpr>(loc, std::move(expr), std::move(index));
+            continue;
+        }
+
+        if (match(TokenType::Dot)) {
+            SourceLoc loc = previous().loc;
+            std::string member = consume(TokenType::Identifier, "Expected member name after '.'").text.str();
+
+            if (check(TokenType::LParen)) {
+                auto args = parseArgumentList();
+                expr = std::make_unique<MemberCallNode>(loc, std::move(expr), member, std::move(args));
+            } else {
+                expr = std::make_unique<MemberExpr>(loc, std::move(expr), member);
+            }
+            continue;
+        }
+
         break;
+    }
+
+    return expr;
+}
+
+
+// =============================================================================
+// Runtime Literal Parsing
+// Syntax:
+//   runtime{
+//       target: expr,
+//       endpoint: expr,
+//       token: expr,
+//       timeout_ms: expr,
+//       max_burn_usd: expr
+//   }
+// =============================================================================
+std::unique_ptr<Expr> Parser::parseRuntimeLiteral() {
+    SourceLoc loc = previous().loc;
+
+    consume(TokenType::LBrace, "Expected '{' after 'runtime'");
+
+    std::vector<RuntimeFieldInit> fields;
+
+    if (!check(TokenType::RBrace)) {
+        do {
+            std::string fieldName = consume(TokenType::Identifier, "Expected runtime field name").text.str();
+            consume(TokenType::Colon, "Expected ':' after runtime field name");
+            fields.emplace_back(fieldName, parseExpr());
+        } while (match(TokenType::Comma));
+    }
+
+    consume(TokenType::RBrace, "Expected '}' after runtime literal");
+    return std::make_unique<RuntimeLiteralExpr>(loc, std::move(fields));
+}
+
+
+std::unique_ptr<Expr> Parser::parseFactor() {
+    std::unique_ptr<Expr> lhs = parseUnary();
+
+    while (match(TokenType::Star) || match(TokenType::Slash) || match(TokenType::Percent)) {
+        SourceLoc loc = previous().loc;
+        std::string op = previous().text.str();
+        std::unique_ptr<Expr> rhs = parseUnary();
+        lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), std::move(rhs));
     }
 
     return lhs;
@@ -863,31 +1045,161 @@ std::unique_ptr<Expr> Parser::parseLambda() {
     return std::make_unique<LambdaExpr>(loc, std::move(params), returnType, std::move(body), hasExplicitReturn);
 }
 
+// =============================================================================
+// Primary Expressions
+// Handles:
+// - allocof<T>(...)
+// - runtime{...}
+// - await token
+// - literals
+// - grouped / tuple
+// - arrays
+// - lambdas
+// - schema init
+// - generic calls
+// =============================================================================
 std::unique_ptr<Expr> Parser::parsePrimary() {
-    std::unique_ptr<Expr> expr = nullptr;
-
     if (match(TokenType::KwAllocof)) {
         SourceLoc loc = previous().loc;
+
         consume(TokenType::Less, "Expected '<' after allocof");
         Type t = parseType();
         consume(TokenType::Greater, "Expected '>' after allocof type");
 
         auto args = parseArgumentList();
-        std::string locStr = "";
-        if (t.space.kind == Space::GPU) locStr = "gpu";
+
+        std::optional<Space> placement;
 
         if (match(TokenType::At)) {
-            if (match(TokenType::KwGpu)) locStr = "gpu";
-            else if (match(TokenType::KwRam)) locStr = "ram";
+            if (match(TokenType::KwGpu)) {
+                if (match(TokenType::Colon)) {
+                    if (match(TokenType::Integer)) {
+                        placement = Space::gpuDevice(std::stoi(previous().text.str()));
+                    } else if (match(TokenType::String)) {
+                        placement = Space::gpuRouteLiteral(stripQuotedToken(previous().text));
+                    } else if (match(TokenType::Identifier)) {
+                        placement = Space::gpuRouteSymbol(previous().text.str());
+                    } else {
+                        errorAt(peek().loc, "Expected GPU device id, route string, or route symbol after '@gpu:'");
+                    }
+                } else {
+                    Space sp;
+                    sp.kind = Space::GPU;
+                    sp.addressKind = Space::AddressKind::Default;
+                    placement = sp;
+                }
+            } else if (match(TokenType::KwRuntime)) {
+                std::string presetName = consume(TokenType::Identifier, "Expected runtime preset name after '@runtime'").text.str();
+                placement = Space::runtimePreset(presetName);
+            } else if (match(TokenType::KwHost) || match(TokenType::KwRam)) {
+                placement = Space::host();
+            } else {
+                errorAt(peek().loc, "Expected placement target after '@'");
+            }
+        } else if (!t.space.isDefault()) {
+            placement = t.space;
+        }
 
-            if (locStr == "gpu" && match(TokenType::Colon)) {
-                Token devId = consume(TokenType::Integer, "Expected GPU ID");
-                locStr += ":" + devId.text.str();
+        std::unique_ptr<Expr> alloc;
+        if (placement.has_value()) {
+            alloc = std::make_unique<AllocExpr>(loc, t, *placement);
+        } else {
+            alloc = std::make_unique<AllocExpr>(loc, t, "");
+        }
+
+        return std::make_unique<CallExpr>(loc, std::move(alloc), std::move(args));
+    }
+
+    if (match(TokenType::KwRuntime)) {
+        return parseRuntimeLiteral();
+    }
+
+    if (match(TokenType::KwAwait)) {
+        SourceLoc loc = previous().loc;
+        std::string tokenName = consume(TokenType::Identifier, "Expected token name after 'await'").text.str();
+        return std::make_unique<AwaitExpr>(loc, tokenName);
+    }
+
+    if (match(TokenType::KwIf)) {
+        return parseIf();
+    }
+
+    if (match(TokenType::KwMatch)) {
+        return parseMatch();
+    }
+
+    if (match(TokenType::Integer)) {
+        SourceLoc loc = previous().loc;
+        Type t;
+        t.kind = Type::I32;
+        return std::make_unique<LiteralExpr>(loc, previous().text.str(), t);
+    }
+
+    if (match(TokenType::Float)) {
+        SourceLoc loc = previous().loc;
+        Type t;
+        t.kind = Type::F64;
+        return std::make_unique<LiteralExpr>(loc, previous().text.str(), t);
+    }
+
+    if (match(TokenType::KwTrue) || match(TokenType::KwFalse)) {
+        SourceLoc loc = previous().loc;
+        Type t;
+        t.kind = Type::Bool;
+        return std::make_unique<LiteralExpr>(loc, previous().text.str(), t);
+    }
+
+    if (match(TokenType::KwNull)) {
+        SourceLoc loc = previous().loc;
+        Type t;
+        t.kind = Type::Void;
+        return std::make_unique<LiteralExpr>(loc, "null", t);
+    }
+
+    if (match(TokenType::String)) {
+        SourceLoc loc = previous().loc;
+        return std::make_unique<StringExpr>(loc, stripQuotedToken(previous().text));
+    }
+
+    if (match(TokenType::Char)) {
+        SourceLoc loc = previous().loc;
+        Type t;
+        t.kind = Type::I32;
+        return std::make_unique<LiteralExpr>(loc, previous().text.str(), t);
+    }
+
+    if (check(TokenType::LBracket)) {
+        return parseArrayLiteral();
+    }
+
+    if (check(TokenType::LParen)) {
+        bool lambdaLike = false;
+        int depth = 0;
+
+        for (std::size_t i = current; i < stream.tokens.size(); ++i) {
+            const TokenType tk = stream.tokens[i].type;
+
+            if (tk == TokenType::LParen) {
+                ++depth;
+            } else if (tk == TokenType::RParen) {
+                --depth;
+                if (depth == 0) {
+                    if (i + 1 < stream.tokens.size()) {
+                        const TokenType next = stream.tokens[i + 1].type;
+                        if (next == TokenType::FatArrow || next == TokenType::Arrow) {
+                            lambdaLike = true;
+                        }
+                    }
+                    break;
+                }
             }
         }
 
-        auto allocExpr = std::make_unique<AllocExpr>(loc, t, locStr);
-        return std::make_unique<CallExpr>(loc, std::move(allocExpr), std::move(args));
+        if (lambdaLike) {
+            return parseLambda();
+        }
+
+        return parseTupleOrGroup();
     }
 
     if (match(TokenType::Identifier) ||
@@ -895,30 +1207,47 @@ std::unique_ptr<Expr> Parser::parsePrimary() {
         match(TokenType::KwNet) ||
         match(TokenType::KwIo) ||
         match(TokenType::KwSys)) {
-
         SourceLoc loc = previous().loc;
         std::string name = previous().text.str();
 
-        while (check(TokenType::Dot)) {
-            if (peekDistance(1).type == TokenType::Identifier) {
-                TokenType ctx = peekDistance(2).type;
-                if (ctx == TokenType::Dot || ctx == TokenType::LBrace || ctx == TokenType::Less) {
-                    consume(TokenType::Dot, "Expected '.'");
-                    std::string part = consume(TokenType::Identifier, "Expected identifier").text.str();
-                    name += "." + part;
-                    continue;
-                }
-            }
-            break;
+        while (check(TokenType::Dot) && peekDistance(1).type == TokenType::Identifier) {
+            advance();
+            name += ".";
+            name += consume(TokenType::Identifier, "Expected identifier after '.'").text.str();
         }
 
-        std::vector<Type> genArgs;
-        if (check(TokenType::Less)) {
-            consume(TokenType::Less, "Expected '<'");
+        auto tryParseGenericArgs = [&]() -> std::optional<std::vector<Type>> {
+            if (!check(TokenType::Less)) {
+                return std::nullopt;
+            }
+
+            const std::size_t savedCurrent = current;
+            const bool savedPanic = panicMode;
+            const std::size_t savedErrorCount = errors.size();
+
+            std::vector<Type> genericArgs;
+
+            match(TokenType::Less);
             do {
-                genArgs.push_back(parseType());
+                genericArgs.push_back(parseType());
             } while (match(TokenType::Comma));
-            consume(TokenType::Greater, "Expected '>'");
+
+            const bool closed = match(TokenType::Greater);
+            const bool validFollower = check(TokenType::LParen) || check(TokenType::LBrace);
+
+            if (!closed || !validFollower || panicMode) {
+                current = savedCurrent;
+                panicMode = savedPanic;
+                errors.resize(savedErrorCount);
+                return std::nullopt;
+            }
+
+            return genericArgs;
+        };
+
+        std::vector<Type> genericArgs;
+        if (auto parsed = tryParseGenericArgs()) {
+            genericArgs = std::move(*parsed);
         }
 
         bool isStructInit = false;
@@ -926,169 +1255,50 @@ std::unique_ptr<Expr> Parser::parsePrimary() {
             if (peekDistance(1).type == TokenType::RBrace) {
                 isStructInit = true;
             } else if (peekDistance(1).type == TokenType::Identifier) {
-                TokenType t2 = peekDistance(2).type;
-                if (t2 == TokenType::Colon || t2 == TokenType::Equal) {
+                const TokenType next2 = peekDistance(2).type;
+                if (next2 == TokenType::Colon || next2 == TokenType::Equal) {
                     isStructInit = true;
                 }
             }
         }
 
         if (isStructInit) {
-            consume(TokenType::LBrace, "");
+            consume(TokenType::LBrace, "Expected '{'");
+
             std::vector<SchemaInitField> fields;
             if (!check(TokenType::RBrace)) {
                 do {
-                    std::string fName = consume(TokenType::Identifier, "Expected field name").text.str();
+                    std::string fieldName = consume(TokenType::Identifier, "Expected field name").text.str();
 
-                    if (match(TokenType::Colon) || match(TokenType::Equal)) {
-                        auto fVal = parseExpr();
-                        fields.push_back({fName, std::move(fVal)});
-                    } else {
-                        errorAt(peek().loc, "Expected ':' or '=' in struct initialization");
+                    if (!(match(TokenType::Colon) || match(TokenType::Equal))) {
+                        errorAt(peek().loc, "Expected ':' or '=' in schema initialization");
+                        break;
                     }
+
+                    fields.push_back({fieldName, parseExpr()});
                 } while (match(TokenType::Comma));
             }
-            consume(TokenType::RBrace, "Expected '}'");
-            expr = std::make_unique<SchemaExpr>(loc, name, genArgs, std::move(fields));
-        } else {
-            if (!genArgs.empty()) {
-                if (check(TokenType::LParen)) {
-                    auto args = parseArgumentList();
-                    auto callee = std::make_unique<SymbolExpr>(loc, name);
-                    expr = std::make_unique<CallExpr>(loc, std::move(callee), std::move(args), std::move(genArgs));
-                } else {
-                    errorAt(loc, "Generic arguments <...> must be followed by call '(...)' or struct init '{...}'");
-                    expr = std::make_unique<SymbolExpr>(loc, name);
-                }
-            } else {
-                expr = std::make_unique<SymbolExpr>(loc, name);
-            }
-        }
-    }
-    else if (match(TokenType::KwIf)) {
-        return parseIf();
-    }
-    else if (match(TokenType::KwMatch)) {
-        return parseMatch();
-    }
-    else if (match(TokenType::Integer)) {
-        std::string txt = previous().text.str();
-        Type t = {Type::I32};
-        try {
-            long long val = std::stoll(txt);
-            if (val > 2147483647 || val < -2147483648) t.kind = Type::I64;
-        } catch (...) { t.kind = Type::I64; }
-        expr = std::make_unique<LiteralExpr>(previous().loc, txt, t);
-    }
-    else if (match(TokenType::Float)) {
-        expr = std::make_unique<LiteralExpr>(previous().loc, previous().text.str(), Type{Type::F32});
-    }
-    else if (match(TokenType::KwTrue)) {
-        expr = std::make_unique<LiteralExpr>(previous().loc, "true", Type{Type::Bool});
-    }
-    else if (match(TokenType::KwFalse)) {
-        expr = std::make_unique<LiteralExpr>(previous().loc, "false", Type{Type::Bool});
-    }
-    else if (match(TokenType::String)) {
-        std::string s = previous().text.str();
-        if (s.size() >= 2) s = s.substr(1, s.size() - 2);
-        expr = std::make_unique<StringExpr>(previous().loc, s);
-    }
-    else if (match(TokenType::Char)) {
-        std::string s = previous().text.str();
-        char c = (s.size() >= 2) ? s[1] : 0;
-        expr = std::make_unique<LiteralExpr>(previous().loc, std::to_string((int)c), Type{Type::U8});
-    }
-    else if (match(TokenType::Minus)) {
-        if (match(TokenType::Integer)) {
-            std::string val = "-" + previous().text.str();
-            Type t = {Type::I32};
-            try {
-                long long v = std::stoll(val);
-                if (v > 2147483647 || v < -2147483648) t.kind = Type::I64;
-            } catch (...) { t.kind = Type::I64; }
-            expr = std::make_unique<LiteralExpr>(previous().loc, val, t);
-        }
-        else if (match(TokenType::Float)) {
-            std::string val = "-" + previous().text.str();
-            expr = std::make_unique<LiteralExpr>(previous().loc, val, Type{Type::F32});
-        }
-        else {
-            errorAt(previous().loc, "Expected number after unary '-'");
-            expr = std::make_unique<LiteralExpr>(previous().loc, "0", Type{Type::I32});
-        }
-    }
-    else if (check(TokenType::LBracket)) {
-        expr = parseArrayLiteral();
-    }
-    else if (match(TokenType::KwAwait)) {
-        SourceLoc loc = previous().loc;
-        std::string t = consume(TokenType::Identifier, "Expected token").text.str();
-        expr = std::make_unique<AwaitExpr>(loc, t);
-    }
-    else if (check(TokenType::LParen)) {
-        bool isLambda = false;
-        if (peekDistance(1).type == TokenType::RParen && peekDistance(2).type == TokenType::FatArrow) {
-            isLambda = true;
-        } else if (peekDistance(1).type == TokenType::Identifier && peekDistance(2).type == TokenType::Colon) {
-            isLambda = true;
+
+            consume(TokenType::RBrace, "Expected '}' after schema initialization");
+            return std::make_unique<SchemaExpr>(loc, name, std::move(genericArgs), std::move(fields));
         }
 
-        if (isLambda) expr = parseLambda();
-        else expr = parseTupleOrGroup();
-    }
-    else {
-        errorAt(peek().loc, "Expected expression (Found: " + std::string(peek().text) + ")");
-        advance();
-        return std::make_unique<SymbolExpr>(peek().loc, "__error__");
-    }
-
-    while (true) {
-        if (match(TokenType::Dot)) {
-            SourceLoc loc = previous().loc;
-            std::string mem = consume(TokenType::Identifier, "Expected member name").text.str();
-
-            if (check(TokenType::LParen)) {
-                auto args = parseArgumentList();
-                expr = std::make_unique<MemberCallNode>(loc, std::move(expr), mem, std::move(args));
-            } else {
-                expr = std::make_unique<MemberExpr>(loc, std::move(expr), mem);
-            }
-        }
-        else if (match(TokenType::LBracket)) {
-            SourceLoc loc = previous().loc;
-            std::unique_ptr<Expr> idxExpr;
-
-            if (match(TokenType::Range)) {
-                std::unique_ptr<Expr> end = nullptr;
-                if (!check(TokenType::RBracket)) end = parseExpr();
-                idxExpr = std::make_unique<RangeExpr>(loc, nullptr, std::move(end));
-            }
-            else {
-                auto start = parseExpr();
-                if (match(TokenType::Range)) {
-                    std::unique_ptr<Expr> end = nullptr;
-                    if (!check(TokenType::RBracket)) end = parseExpr();
-                    idxExpr = std::make_unique<RangeExpr>(loc, std::move(start), std::move(end));
-                } else {
-                    idxExpr = std::move(start);
-                }
-            }
-            consume(TokenType::RBracket, "Expected ']'");
-
-            expr = std::make_unique<IndexExpr>(loc, std::move(expr), std::move(idxExpr));
-        }
-        else if (check(TokenType::LParen)) {
-            SourceLoc callLoc = peek().loc;
+        if (!genericArgs.empty() && check(TokenType::LParen)) {
             auto args = parseArgumentList();
-            expr = std::make_unique<CallExpr>(callLoc, std::move(expr), std::move(args));
+            auto callee = std::make_unique<SymbolExpr>(loc, name);
+            return std::make_unique<CallExpr>(loc, std::move(callee), std::move(args), std::move(genericArgs));
         }
-        else {
-            break;
-        }
+
+        return std::make_unique<SymbolExpr>(loc, name);
     }
 
-    return expr;
+    errorAt(peek().loc, "Expected expression");
+    SourceLoc loc = peek().loc;
+    if (!isAtEnd()) advance();
+
+    Type t;
+    t.kind = Type::Void;
+    return std::make_unique<LiteralExpr>(loc, "0", t);
 }
 
 
@@ -1304,134 +1514,137 @@ std::unique_ptr<Decl> Parser::parseTopLevel() {
 
 // =============================================================================
 // Type Parsing
-// Handles: Primitives, Tuples, Containers (vec<T>), Generics (Box<T>), Shapes
+// Supports:
+// - primitives
+// - tuples
+// - containers
+// - user types / generics
+// - optional shape suffixes
+// - placement suffixes:
+//     @gpu
+//     @gpu:0
+//     @gpu:"route"
+//     @gpu:route
+//     @runtime preset
+//     @host / @ram
 // =============================================================================
 Type Parser::parseType() {
-    // 1. Tuple Type OR Grouping: (i32, f32) vs (i32)
-    if (check(TokenType::LParen)) {
-        consume(TokenType::LParen, "Expected '('");
-        
-        // Handle Unit: () -> Void
-        if (check(TokenType::RParen)) {
-            consume(TokenType::RParen, "Expected ')'");
+    if (match(TokenType::LParen)) {
+        if (match(TokenType::RParen)) {
             return Type{Type::Void};
         }
 
         Type first = parseType();
 
-        // If comma follows, it is a Tuple: (i32, f32) or (i32,)
         if (match(TokenType::Comma)) {
-            Type t;
-            t.kind = Type::Tuple;
-            
-            // [FIX] Use subtypes for Tuple elements (matches AST.h)
-            t.subtypes.push_back(first);
+            Type tupleType;
+            tupleType.kind = Type::Tuple;
+            tupleType.subtypes.push_back(std::move(first));
 
             do {
-                // Handle trailing comma: (i32,)
                 if (check(TokenType::RParen)) break;
-                
-                t.subtypes.push_back(parseType());
+                tupleType.subtypes.push_back(parseType());
             } while (match(TokenType::Comma));
 
-            consume(TokenType::RParen, "Expect ')' after tuple type");
-            return t;
+            consume(TokenType::RParen, "Expected ')' after tuple type");
+            return tupleType;
         }
 
-        // No comma? It's just a grouping: (i32) -> i32
-        consume(TokenType::RParen, "Expect ')' after parenthesized type");
+        consume(TokenType::RParen, "Expected ')' after parenthesized type");
         return first;
     }
 
     Type t;
-    t.kind = Type::Void; 
-    
-    // 2. Primitives
-    if (match(TokenType::KwU8))       t.kind = Type::U8;
-    else if (match(TokenType::KwU16)) t.kind = Type::U16;
-    else if (match(TokenType::KwU32)) t.kind = Type::U32;
-    else if (match(TokenType::KwU64)) t.kind = Type::U64;
-    else if (match(TokenType::KwI8))  t.kind = Type::I8;
-    else if (match(TokenType::KwI16)) t.kind = Type::I16;
-    else if (match(TokenType::KwI32)) t.kind = Type::I32;
-    else if (match(TokenType::KwI64)) t.kind = Type::I64;
-    else if (match(TokenType::KwF32)) t.kind = Type::F32;
-    else if (match(TokenType::KwF64)) t.kind = Type::F64;
+    bool parsedBase = true;
+
+    if (match(TokenType::KwVoid))      t.kind = Type::Void;
+    else if (match(TokenType::KwU8))   t.kind = Type::U8;
+    else if (match(TokenType::KwU16))  t.kind = Type::U16;
+    else if (match(TokenType::KwU32))  t.kind = Type::U32;
+    else if (match(TokenType::KwU64))  t.kind = Type::U64;
+    else if (match(TokenType::KwI8))   t.kind = Type::I8;
+    else if (match(TokenType::KwI16))  t.kind = Type::I16;
+    else if (match(TokenType::KwI32))  t.kind = Type::I32;
+    else if (match(TokenType::KwI64))  t.kind = Type::I64;
+    else if (match(TokenType::KwF32))  t.kind = Type::F32;
+    else if (match(TokenType::KwF64))  t.kind = Type::F64;
     else if (match(TokenType::KwBool)) t.kind = Type::Bool;
     else if (match(TokenType::KwStr))  t.kind = Type::Str;
-    else if (match(TokenType::KwVoid)) t.kind = Type::Void;
-    
-    // 3. Built-in Container Keywords
-    else if (match(TokenType::KwVec))    t.kind = Type::Vec;
-    else if (match(TokenType::KwSlice))  t.kind = Type::Slice;
+    else if (match(TokenType::KwVec))  t.kind = Type::Vec;
+    else if (match(TokenType::KwSlice)) t.kind = Type::Slice;
     else if (match(TokenType::KwTensor)) t.kind = Type::Tensor;
-    
-    // 4. User Types & User Generics
     else if (match(TokenType::Identifier)) {
-        std::string name = previous().text.str();
-        
-        if (match(TokenType::Less)) {
-            t.kind = Type::Generic;
-            t.schemaName = name;
-            do {
-                t.genericArgs.push_back(parseType());
-            } while (match(TokenType::Comma));
-            consume(TokenType::Greater, "Expect '>' after generic arguments");
-        } 
-        else {
-            t.kind = Type::Schema;
-            t.schemaName = name;
-        }
-    }
-    
-    // 5. Generics for Built-in Containers (vec<T>)
-    if (t.isContainer()) {
-        consume(TokenType::Less, "Expected '<'");
-        Type inner = parseType();
-        
-        // [FIX] Store element type in genericArgs[0] (Unified System)
-        t.genericArgs.push_back(inner);
-        
-        consume(TokenType::Greater, "Expected '>'");
-    }
-    
-    // 6. Tensor Shape Syntax: T[2, 2] -> Tensor<T> with shape
-    //    Allows writing "f32[2, 2]" instead of "tensor<f32>"
-    if (check(TokenType::LBracket)) {
-        // Wrap current type 't' as the element of a new Tensor type
-        if (t.kind != Type::Tensor) {
-             Type element = t;
-             t = Type(); // Reset
-             t.kind = Type::Tensor;
-             
-             // [FIX] Unified Generic Storage
-             t.genericArgs.push_back(element);
-        }
+        t.kind = Type::Schema;
+        t.schemaName = previous().text.str();
 
-        while (match(TokenType::LBracket)) {
-             if (check(TokenType::Integer)) {
-                 t.shape.push_back(advance().text.str());
-             } else {
-                 t.shape.push_back(consume(TokenType::Identifier, "Expected size identifier").text.str());
-             }
-             consume(TokenType::RBracket, "Expected ']'");
+        while (match(TokenType::Dot)) {
+            std::string part = consume(TokenType::Identifier, "Expected identifier after '.' in type name").text.str();
+            t.schemaName += ".";
+            t.schemaName += part;
+        }
+    } else {
+        parsedBase = false;
+        errorAt(peek().loc, "Expected type");
+        return Type{Type::Void};
+    }
+
+    if (parsedBase && match(TokenType::Less)) {
+        do {
+            t.genericArgs.push_back(parseType());
+        } while (match(TokenType::Comma));
+        consume(TokenType::Greater, "Expected '>' after generic arguments");
+
+        if (t.kind == Type::Schema) {
+            t.kind = Type::Generic;
         }
     }
-    
-    // 7. Memory Space: @gpu:0
+
+    if (match(TokenType::LBracket)) {
+        do {
+            if (match(TokenType::Question)) {
+                t.shape.push_back("?");
+            } else if (match(TokenType::Integer) || match(TokenType::Identifier)) {
+                t.shape.push_back(previous().text.str());
+            } else {
+                errorAt(peek().loc, "Expected shape dimension");
+                break;
+            }
+        } while (match(TokenType::Comma));
+
+        consume(TokenType::RBracket, "Expected ']' after shape suffix");
+    }
+
     if (match(TokenType::At)) {
         if (match(TokenType::KwGpu)) {
-            t.space.kind = Space::GPU;
             if (match(TokenType::Colon)) {
-                 std::string devId = consume(TokenType::Integer, "Expected device ID").text.str();
-                 try { t.space.deviceId = std::stoi(devId); } catch(...) {}
+                if (match(TokenType::Integer)) {
+                    t.space = Space::gpuDevice(std::stoi(previous().text.str()));
+                } else if (match(TokenType::String)) {
+                    t.space = Space::gpuRouteLiteral(stripQuotedToken(previous().text));
+                } else if (match(TokenType::Identifier)) {
+                    t.space = Space::gpuRouteSymbol(previous().text.str());
+                } else {
+                    errorAt(peek().loc, "Expected GPU device id, route string, or route symbol after '@gpu:'");
+                    t.space.kind = Space::GPU;
+                    t.space.addressKind = Space::AddressKind::Default;
+                }
+            } else {
+                t.space.kind = Space::GPU;
+                t.space.addressKind = Space::AddressKind::Default;
             }
-        } else if (match(TokenType::KwRam)) {
-            t.space.kind = Space::RAM;
+        } else if (match(TokenType::KwHost) || match(TokenType::KwRam)) {
+            t.space = Space::host();
+        } else if (match(TokenType::KwRuntime)) {
+            std::string presetName = consume(TokenType::Identifier, "Expected runtime preset name after '@runtime'").text.str();
+            t.space = Space::runtimePreset(presetName);
+        } else {
+            errorAt(peek().loc, "Expected placement suffix after '@'");
         }
     }
 
     return t;
 }
+
+
 
 } // namespace arklang

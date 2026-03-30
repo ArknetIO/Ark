@@ -1,6 +1,7 @@
 // tools/compiler/CLI/Config.cpp
 #include "Config.h"
 #include "Subcommands.h"
+#include "Common.h"
 #include "ark/crypto/Vault.h"
 
 #include <CLI/CLI.hpp>
@@ -30,6 +31,9 @@
 namespace ark::cli {
 namespace {
 
+// =============================================================================
+// Output & Failure Helpers
+// =============================================================================
 void printOut(const std::string& s) {
     llvm::outs() << s;
 }
@@ -47,6 +51,9 @@ void warn(const std::string& s) {
     std::exit(1);
 }
 
+// =============================================================================
+// Small String Helpers
+// =============================================================================
 std::string toString(llvm::StringRef s) {
     return std::string(s.data(), s.size());
 }
@@ -57,28 +64,41 @@ std::vector<std::string> splitKey(const std::string& key) {
 
     for (char c : key) {
         if (c == '.') {
-            if (cur.empty()) fail("Invalid config key: empty segment in '" + key + "'");
+            if (cur.empty()) {
+                fail("Invalid config key: empty segment in '" + key + "'");
+            }
+
             parts.push_back(cur);
             cur.clear();
             continue;
         }
+
         cur.push_back(c);
     }
 
-    if (cur.empty()) fail("Invalid config key: empty segment in '" + key + "'");
+    if (cur.empty()) {
+        fail("Invalid config key: empty segment in '" + key + "'");
+    }
+
     parts.push_back(cur);
     return parts;
 }
 
+// =============================================================================
+// File Write Helpers
+// =============================================================================
 static void ensureParentDirExists(const std::string& path) {
     llvm::SmallString<256> p(path);
-    llvm::StringRef parent = llvm::sys::path::parent_path(p);
-    if (parent.empty()) return;
+    const llvm::StringRef parent = llvm::sys::path::parent_path(p);
+    if (parent.empty()) {
+        return;
+    }
 
-    const std::string parentStr = parent.str();
-
-    std::error_code ec = llvm::sys::fs::create_directories(parent);
-    if (ec) fail("Failed to create parent directory '" + parentStr + "': " + ec.message());
+    const std::string parentStr = std::string(parent);
+    const std::error_code ec = llvm::sys::fs::create_directories(parent);
+    if (ec) {
+        fail("Failed to create parent directory '" + parentStr + "': " + ec.message());
+    }
 }
 
 void writeTextFileAtomicOrFail(const std::string& path, llvm::StringRef content) {
@@ -89,7 +109,9 @@ void writeTextFileAtomicOrFail(const std::string& path, llvm::StringRef content)
     {
         std::error_code ec;
         llvm::raw_fd_ostream os(tmpPath, ec, llvm::sys::fs::OF_Text);
-        if (ec) fail("Failed to open temp file '" + tmpPath + "': " + ec.message());
+        if (ec) {
+            fail("Failed to open temp file '" + tmpPath + "': " + ec.message());
+        }
 
         os << content;
         os.flush();
@@ -101,7 +123,7 @@ void writeTextFileAtomicOrFail(const std::string& path, llvm::StringRef content)
         }
     }
 
-    std::error_code ec = llvm::sys::fs::rename(tmpPath, path);
+    const std::error_code ec = llvm::sys::fs::rename(tmpPath, path);
     if (ec) {
         (void)llvm::sys::fs::remove(tmpPath);
         fail("Failed to replace '" + path + "': " + ec.message());
@@ -114,47 +136,87 @@ void saveTomlAtomicOrFail(const std::string& path, const toml::table& tbl) {
     writeTextFileAtomicOrFail(path, ss.str());
 }
 
+// =============================================================================
+// TOML Parsing Helpers
+// =============================================================================
 std::optional<toml::table> parseTomlIfExists(const std::string& path, bool warnOnParseError = true) {
-    if (!llvm::sys::fs::exists(path)) return std::nullopt;
+    if (!llvm::sys::fs::exists(path)) {
+        return std::nullopt;
+    }
 
-    try {
-        return toml::parse_file(path);
-    } catch (const toml::parse_error& err) {
+    auto parsed = parseTomlFilePortable(path);
+    if (!parsed) {
         if (warnOnParseError) {
-            warn("Failed to parse " + path + ": " + std::string(err.description()));
+            warn("Failed to parse " + path + ": " + parsed.error);
         }
-    } catch (...) {
-        if (warnOnParseError) {
-            warn("Failed to parse " + path + ": unknown parse error");
-        }
+        return std::nullopt;
+    }
+
+    return parsed.take();
+}
+
+toml::table parseTomlOrFail(const std::string& path) {
+    auto parsed = parseTomlFilePortable(path);
+    if (!parsed) {
+        fail("Failed to parse " + path + ": " + parsed.error);
+    }
+
+    return parsed.take();
+}
+
+// =============================================================================
+// TOML Value Helpers
+// =============================================================================
+std::optional<std::string> scalarNodeToString(const toml::node& n) {
+    if (auto* s = n.as_string()) {
+        return s->get();
+    }
+
+    if (auto* i = n.as_integer()) {
+        return std::to_string(i->get());
+    }
+
+    if (auto* b = n.as_boolean()) {
+        return b->get() ? "true" : "false";
+    }
+
+    if (auto* f = n.as_floating_point()) {
+        return std::to_string(f->get());
     }
 
     return std::nullopt;
 }
 
-std::optional<std::string> scalarNodeToString(const toml::node& n) {
-    if (auto* s = n.as_string()) return s->get();
-    if (auto* i = n.as_integer()) return std::to_string(i->get());
-    if (auto* b = n.as_boolean()) return b->get() ? "true" : "false";
-    if (auto* f = n.as_floating_point()) return std::to_string(f->get());
-    return std::nullopt;
-}
-
-void flattenToml(const toml::table& tbl, const std::string& prefix, std::vector<std::pair<std::string, std::string>>& out) {
+void flattenToml(
+    const toml::table& tbl,
+    const std::string& prefix,
+    std::vector<std::pair<std::string, std::string>>& out
+) {
     for (auto&& [k, v] : tbl) {
-        const std::string key = prefix.empty() ? std::string(k.str()) : (prefix + "." + std::string(k.str()));
+        const std::string key = prefix.empty()
+            ? std::string(k.str())
+            : (prefix + "." + std::string(k.str()));
+
         if (auto* t = v.as_table()) {
             flattenToml(*t, key, out);
             continue;
         }
 
-        if (auto val = scalarNodeToString(v)) out.emplace_back(key, *val);
-        else out.emplace_back(key, "[complex value]");
+        if (auto val = scalarNodeToString(v)) {
+            out.emplace_back(key, *val);
+        } else {
+            out.emplace_back(key, "[complex value]");
+        }
     }
 }
 
-toml::table* ensurePathTables(toml::table& root, const std::vector<std::string>& parts, std::size_t countForTables) {
+toml::table* ensurePathTables(
+    toml::table& root,
+    const std::vector<std::string>& parts,
+    std::size_t countForTables
+) {
     toml::table* cur = &root;
+
     for (std::size_t i = 0; i < countForTables; ++i) {
         const std::string& seg = parts[i];
 
@@ -164,28 +226,41 @@ toml::table* ensurePathTables(toml::table& root, const std::vector<std::string>&
         }
 
         cur = cur->get_as<toml::table>(seg);
-        if (!cur) fail("Failed to create config table path segment '" + seg + "'");
+        if (!cur) {
+            fail("Failed to create config table path segment '" + seg + "'");
+        }
     }
+
     return cur;
 }
 
 toml::table& ensureTableKey(toml::table& root, const std::string& key) {
     auto* n = root.get(key);
-    if (!n || !n->is_table()) root.insert_or_assign(key, toml::table{});
+    if (!n || !n->is_table()) {
+        root.insert_or_assign(key, toml::table{});
+    }
+
     auto* t = root.get_as<toml::table>(key);
-    if (!t) fail("Failed to create table '" + key + "'");
+    if (!t) {
+        fail("Failed to create table '" + key + "'");
+    }
+
     return *t;
 }
 
 toml::table* getSecretRecordTable(toml::table& root, const std::string& section, const std::string& key) {
     auto* sec = root.get_as<toml::table>(section);
-    if (!sec) return nullptr;
+    if (!sec) {
+        return nullptr;
+    }
     return sec->get_as<toml::table>(key);
 }
 
 const toml::table* getSecretRecordTable(const toml::table& root, const std::string& section, const std::string& key) {
     auto* sec = root.get_as<toml::table>(section);
-    if (!sec) return nullptr;
+    if (!sec) {
+        return nullptr;
+    }
     return sec->get_as<toml::table>(key);
 }
 
@@ -202,8 +277,10 @@ std::string promptForPassword(const std::string& promptText) {
 
 #if defined(_WIN32)
     for (;;) {
-        int raw = _getch();
-        if (raw == '\r') break;
+        const int raw = _getch();
+        if (raw == '\r') {
+            break;
+        }
 
         if (raw == 3) {
             llvm::outs() << "\n";
@@ -241,8 +318,11 @@ std::string promptForPassword(const std::string& promptText) {
     struct TermRestore {
         termios saved {};
         bool active = false;
+
         ~TermRestore() {
-            if (active) tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+            if (active) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+            }
         }
     } restore;
 
@@ -251,6 +331,7 @@ std::string promptForPassword(const std::string& promptText) {
 
     struct termios newt = oldt;
     newt.c_lflag &= ~(ICANON | ECHO);
+
     if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
         restore.active = false;
         std::string fallback;
@@ -260,7 +341,9 @@ std::string promptForPassword(const std::string& promptText) {
 
     char ch = '\0';
     while (read(STDIN_FILENO, &ch, 1) == 1) {
-        if (ch == '\n' || ch == '\r') break;
+        if (ch == '\n' || ch == '\r') {
+            break;
+        }
 
         if (ch == 3) {
             llvm::outs() << "\n";
@@ -295,7 +378,9 @@ std::string GlobalConfig::getArknetDir() {
 
     auto envOrEmpty = [](const char* key) -> std::string {
         if (const char* v = std::getenv(key)) {
-            if (*v) return std::string(v);
+            if (*v) {
+                return std::string(v);
+            }
         }
         return {};
     };
@@ -324,8 +409,10 @@ std::string GlobalConfig::getArknetDir() {
                 llvm::sys::path::append(arkDir, ".arknet");
             } else {
                 llvm::SmallString<256> cwd;
-                if (llvm::sys::fs::current_path(cwd))
+                if (llvm::sys::fs::current_path(cwd)) {
                     fail("Unable to determine home directory or current directory.");
+                }
+
                 warn("Home directory unavailable; using local ./.arknet");
                 arkDir = cwd;
                 llvm::sys::path::append(arkDir, ".arknet");
@@ -336,8 +423,10 @@ std::string GlobalConfig::getArknetDir() {
                 llvm::sys::path::append(arkDir, ".arknet");
             } else {
                 llvm::SmallString<256> cwd;
-                if (llvm::sys::fs::current_path(cwd))
+                if (llvm::sys::fs::current_path(cwd)) {
                     fail("Unable to determine home directory or current directory.");
+                }
+
                 warn("Home directory unavailable; using local ./.arknet");
                 arkDir = cwd;
                 llvm::sys::path::append(arkDir, ".arknet");
@@ -346,11 +435,15 @@ std::string GlobalConfig::getArknetDir() {
         }
     }
 
-    std::error_code ec = llvm::sys::fs::create_directories(arkDir);
-    if (ec) fail("Failed to create Arknet config directory '" + std::string(arkDir.str()) + "': " + ec.message());
+    const std::error_code ec = llvm::sys::fs::create_directories(arkDir);
+    if (ec) {
+        fail("Failed to create Arknet config directory '" + std::string(arkDir.str()) + "': " + ec.message());
+    }
 
-    std::error_code permEc = llvm::sys::fs::setPermissions(arkDir, llvm::sys::fs::owner_all);
-    if (permEc) warn("Failed to set permissions on Arknet config directory: " + permEc.message());
+    const std::error_code permEc = llvm::sys::fs::setPermissions(arkDir, llvm::sys::fs::owner_all);
+    if (permEc) {
+        warn("Failed to set permissions on Arknet config directory: " + permEc.message());
+    }
 
     return std::string(arkDir.str());
 }
@@ -371,36 +464,55 @@ std::string GlobalConfig::getCredentialsFilePath() {
 // Standard Config (config.toml)
 // =============================================================================
 std::optional<std::string> GlobalConfig::get(const std::string& key) {
-    if (key.empty()) return std::nullopt;
+    if (key.empty()) {
+        return std::nullopt;
+    }
 
     const std::string path = getConfigFilePath();
     auto tblOpt = parseTomlIfExists(path);
-    if (!tblOpt) return std::nullopt;
+    if (!tblOpt) {
+        return std::nullopt;
+    }
 
-    auto parts = splitKey(key);
+    const auto parts = splitKey(key);
 
     toml::node* cur = nullptr;
     if (parts.size() == 1) {
         auto* core = tblOpt->get_as<toml::table>("core");
-        if (!core) return std::nullopt;
+        if (!core) {
+            return std::nullopt;
+        }
+
         cur = core->get(parts[0]);
-        if (!cur) return std::nullopt;
+        if (!cur) {
+            return std::nullopt;
+        }
     } else {
         cur = &*tblOpt;
         for (std::size_t i = 0; i < parts.size(); ++i) {
             auto* t = cur->as_table();
-            if (!t) return std::nullopt;
+            if (!t) {
+                return std::nullopt;
+            }
+
             cur = t->get(parts[i]);
-            if (!cur) return std::nullopt;
+            if (!cur) {
+                return std::nullopt;
+            }
         }
     }
 
-    if (auto val = scalarNodeToString(*cur)) return val;
+    if (auto val = scalarNodeToString(*cur)) {
+        return val;
+    }
+
     return std::nullopt;
 }
 
 void GlobalConfig::set(const std::string& key, const std::string& value) {
-    if (key.empty()) fail("Config key cannot be empty.");
+    if (key.empty()) {
+        fail("Config key cannot be empty.");
+    }
 
     const std::string path = getConfigFilePath();
 
@@ -410,7 +522,9 @@ void GlobalConfig::set(const std::string& key, const std::string& value) {
     }
 
     const auto parts = splitKey(key);
-    if (parts.empty()) fail("Config key cannot be empty.");
+    if (parts.empty()) {
+        fail("Config key cannot be empty.");
+    }
 
     toml::table* parent = nullptr;
     std::string param;
@@ -419,6 +533,7 @@ void GlobalConfig::set(const std::string& key, const std::string& value) {
         if (!tbl.contains("core") || !tbl["core"].is_table()) {
             tbl.insert_or_assign("core", toml::table{});
         }
+
         parent = tbl["core"].as_table();
         param = parts[0];
     } else {
@@ -426,9 +541,11 @@ void GlobalConfig::set(const std::string& key, const std::string& value) {
         param = parts.back();
     }
 
-    if (!parent) fail("Failed to resolve target config table for key '" + key + "'");
-    parent->insert_or_assign(param, value);
+    if (!parent) {
+        fail("Failed to resolve target config table for key '" + key + "'");
+    }
 
+    parent->insert_or_assign(param, value);
     saveTomlAtomicOrFail(path, tbl);
 }
 
@@ -439,23 +556,20 @@ void GlobalConfig::list() {
         return;
     }
 
-    try {
-        toml::table tbl = toml::parse_file(path);
+    auto tblOpt = parseTomlIfExists(path);
+    if (!tblOpt) {
+        fail("Failed to parse config: " + path);
+    }
 
-        std::vector<std::pair<std::string, std::string>> flat;
-        flattenToml(tbl, "", flat);
+    std::vector<std::pair<std::string, std::string>> flat;
+    flattenToml(*tblOpt, "", flat);
 
-        std::sort(flat.begin(), flat.end(), [](const auto& a, const auto& b) {
-            return a.first < b.first;
-        });
+    std::sort(flat.begin(), flat.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
 
-        for (const auto& [k, v] : flat) {
-            llvm::outs() << k << " = " << v << "\n";
-        }
-    } catch (const toml::parse_error& err) {
-        llvm::errs() << "[error] Failed to parse config: " << err.description() << "\n";
-    } catch (...) {
-        llvm::errs() << "[error] Failed to parse config.\n";
+    for (const auto& [k, v] : flat) {
+        llvm::outs() << k << " = " << v << "\n";
     }
 }
 
@@ -464,37 +578,45 @@ void GlobalConfig::list() {
 // =============================================================================
 bool GlobalConfig::hasEncryptedSecret(const std::string& section, const std::string& key) {
     const std::string path = getCredentialsFilePath();
-    if (!llvm::sys::fs::exists(path)) return false;
-
-    try {
-        toml::table tbl = toml::parse_file(path);
-
-        if (const auto* rec = getSecretRecordTable(tbl, section, key)) {
-            auto* ct = rec->get_as<std::string>("ciphertext");
-            return ct && !ct->get().empty();
-        }
-
-        // Legacy compatibility: [auth] ciphertext=...
-        if (section == "auth" && key == "provider_token") {
-            if (auto* auth = tbl.get_as<toml::table>("auth")) {
-                if (auto* ct = auth->get_as<std::string>("ciphertext")) {
-                    return !ct->get().empty();
-                }
-            }
-        }
-
+    if (!llvm::sys::fs::exists(path)) {
         return false;
-    } catch (...) {
+    }
+
+    auto tblOpt = parseTomlIfExists(path, false);
+    if (!tblOpt) {
         return true;
     }
+
+    if (const auto* rec = getSecretRecordTable(*tblOpt, section, key)) {
+        auto* ct = rec->get_as<std::string>("ciphertext");
+        return ct && !ct->get().empty();
+    }
+
+    // Legacy compatibility: [auth] ciphertext=...
+    if (section == "auth" && key == "provider_token") {
+        if (auto* auth = tblOpt->get_as<toml::table>("auth")) {
+            if (auto* ct = auth->get_as<std::string>("ciphertext")) {
+                return !ct->get().empty();
+            }
+        }
+    }
+
+    return false;
 }
 
-void GlobalConfig::setEncryptedSecret(const std::string& section,
-                                      const std::string& key,
-                                      const std::string& value,
-                                      const std::string& masterPassword) {
-    if (section.empty()) fail("Secret section cannot be empty.");
-    if (key.empty()) fail("Secret key cannot be empty.");
+void GlobalConfig::setEncryptedSecret(
+    const std::string& section,
+    const std::string& key,
+    const std::string& value,
+    const std::string& masterPassword
+) {
+    if (section.empty()) {
+        fail("Secret section cannot be empty.");
+    }
+
+    if (key.empty()) {
+        fail("Secret key cannot be empty.");
+    }
 
     auto encryptedB64 = ark::crypto::Vault::encrypt(value, masterPassword);
     if (!encryptedB64) {
@@ -516,39 +638,48 @@ void GlobalConfig::setEncryptedSecret(const std::string& section,
 
     saveTomlAtomicOrFail(path, tbl);
 
-    std::error_code permEc = llvm::sys::fs::setPermissions(
+    const std::error_code permEc = llvm::sys::fs::setPermissions(
         path,
-        llvm::sys::fs::owner_read | llvm::sys::fs::owner_write);
+        llvm::sys::fs::owner_read | llvm::sys::fs::owner_write
+    );
 
-    if (permEc) warn("Failed to tighten permissions on credentials file: " + permEc.message());
+    if (permEc) {
+        warn("Failed to tighten permissions on credentials file: " + permEc.message());
+    }
 }
 
-std::optional<std::string> GlobalConfig::getDecryptedSecret(const std::string& section,
-                                                            const std::string& key,
-                                                            const std::string& masterPassword) {
-    if (section.empty() || key.empty()) return std::nullopt;
+std::optional<std::string> GlobalConfig::getDecryptedSecret(
+    const std::string& section,
+    const std::string& key,
+    const std::string& masterPassword
+) {
+    if (section.empty() || key.empty()) {
+        return std::nullopt;
+    }
 
     const std::string path = getCredentialsFilePath();
-    if (!llvm::sys::fs::exists(path)) return std::nullopt;
+    if (!llvm::sys::fs::exists(path)) {
+        return std::nullopt;
+    }
 
-    try {
-        toml::table tbl = toml::parse_file(path);
+    auto tblOpt = parseTomlIfExists(path, false);
+    if (!tblOpt) {
+        return std::nullopt;
+    }
 
-        if (const auto* rec = getSecretRecordTable(tbl, section, key)) {
-            if (auto* ct = rec->get_as<std::string>("ciphertext")) {
+    if (const auto* rec = getSecretRecordTable(*tblOpt, section, key)) {
+        if (auto* ct = rec->get_as<std::string>("ciphertext")) {
+            return ark::crypto::Vault::decrypt(ct->get(), masterPassword);
+        }
+    }
+
+    // Legacy compatibility: [auth] ciphertext=...
+    if (section == "auth" && key == "provider_token") {
+        if (auto* auth = tblOpt->get_as<toml::table>("auth")) {
+            if (auto* ct = auth->get_as<std::string>("ciphertext")) {
                 return ark::crypto::Vault::decrypt(ct->get(), masterPassword);
             }
         }
-
-        // Legacy compatibility: [auth] ciphertext=...
-        if (section == "auth" && key == "provider_token") {
-            if (auto* auth = tbl.get_as<toml::table>("auth")) {
-                if (auto* ct = auth->get_as<std::string>("ciphertext")) {
-                    return ark::crypto::Vault::decrypt(ct->get(), masterPassword);
-                }
-            }
-        }
-    } catch (...) {
     }
 
     return std::nullopt;
@@ -628,8 +759,13 @@ void setupConfigCmd(CLI::App& app) {
             std::string pwd1 = promptForPassword("Set a master password to encrypt this token");
             std::string pwd2 = promptForPassword("Confirm master password");
 
-            if (pwd1.empty()) fail("Master password cannot be empty.");
-            if (pwd1 != pwd2) fail("Passwords do not match. Aborting.");
+            if (pwd1.empty()) {
+                fail("Master password cannot be empty.");
+            }
+
+            if (pwd1 != pwd2) {
+                fail("Passwords do not match. Aborting.");
+            }
 
             GlobalConfig::setEncryptedToken(token, pwd1);
             note("Token encrypted and saved securely to ~/.arknet/credentials.toml");
@@ -641,8 +777,11 @@ void setupConfigCmd(CLI::App& app) {
                 note("Authenticated. Credential vault is present.");
                 std::string pwd = promptForPassword("Enter master password to test decryption");
                 auto token = GlobalConfig::getDecryptedToken(pwd);
-                if (token && !token->empty()) note("Decryption successful.");
-                else fail("Decryption failed. Invalid password or corrupted vault.");
+                if (token && !token->empty()) {
+                    note("Decryption successful.");
+                } else {
+                    fail("Decryption failed. Invalid password or corrupted vault.");
+                }
             } else {
                 note("Not logged in. Run `arknet config --login` to authenticate.");
             }

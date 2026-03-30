@@ -444,6 +444,23 @@ static inline const char* backend_last_error(const ark_gpu_backend_v1* vt) {
 using FatbinQueryFn = const ark_gpu_fatbin_v1* (*)();
 
 namespace {
+static inline std::string ptr_hex(const void* p) {
+    const std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
+    char buf[2 + sizeof(std::uintptr_t) * 2 + 1];
+    static constexpr char kHex[] = "0123456789abcdef";
+
+    buf[0] = '0';
+    buf[1] = 'x';
+
+    for (std::size_t i = 0; i < sizeof(std::uintptr_t) * 2; ++i) {
+        const std::size_t shift = (sizeof(std::uintptr_t) * 8 - 4) - i * 4;
+        buf[2 + i] = kHex[(v >> shift) & 0xF];
+    }
+
+    buf[2 + sizeof(std::uintptr_t) * 2] = '\0';
+    return std::string(buf);
+}
+
 #if defined(_WIN32)
 static std::string win32_last_error_string() {
     const DWORD e = ::GetLastError();
@@ -456,26 +473,12 @@ static std::string dl_last_error_string() {
     return "dlerror=(none)";
 }
 
-static inline std::string ptr_hex(const void* p) {
-    const std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
-    char buf[2 + sizeof(std::uintptr_t) * 2 + 1];
-    static constexpr char kHex[] = "0123456789abcdef";
-
-    buf[0] = '0';
-    buf[1] = 'x';
-    for (std::size_t i = 0; i < sizeof(std::uintptr_t) * 2; ++i) {
-        const std::size_t shift = (sizeof(std::uintptr_t) * 8 - 4) - i * 4;
-        buf[2 + i] = kHex[(v >> shift) & 0xF];
-    }
-    buf[2 + sizeof(std::uintptr_t) * 2] = 0;
-    return std::string(buf);
-}
-
-
-static std::string dl_addr_string(void* p) {
+static std::string dl_addr_string(const void* p) {
     if (!p) return "dladdr=null";
+
     Dl_info info{};
-    if (::dladdr(p, &info) == 0) return "dladdr=failed";
+    if (::dladdr(const_cast<void*>(p), &info) == 0) return "dladdr=failed";
+
     std::string out;
     out.reserve(256);
     out += "dladdr.sname=";
@@ -496,6 +499,7 @@ static std::string proc_self_maps_hint() {
 static void fatbin_debug_not_found(const char* phase, const char* detail) {
     if (!phase) phase = "(phase)";
     if (!detail) detail = "(detail)";
+
     std::string msg;
     msg.reserve(512);
     msg += "ark_gpu_fatbin_query_v1 not found; phase=";
@@ -506,10 +510,9 @@ static void fatbin_debug_not_found(const char* phase, const char* detail) {
     msg += " ";
     msg += proc_self_maps_hint();
 #endif
-    // std::fprintf(stderr, "[ARK GPU_HAL][DBG] fatbin: %s\n", msg.c_str());
 }
 
-static void fatbin_debug_found(void* p) {
+static void fatbin_debug_found(const void* p) {
     std::string msg;
     msg.reserve(256);
     msg += "ark_gpu_fatbin_query_v1 resolved; addr=";
@@ -518,9 +521,9 @@ static void fatbin_debug_found(void* p) {
     msg += " ";
     msg += dl_addr_string(p);
 #endif
-    // std::fprintf(stderr, "[ARK GPU_HAL][DBG] fatbin: %s\n", msg.c_str());
 }
 } // namespace
+
 
 #if !defined(_WIN32)
 extern "C" {
