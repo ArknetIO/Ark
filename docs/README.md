@@ -72,7 +72,7 @@ The compiler reads `.ark` source files and outputs MLIR code.
 
 Here is the **Monolith Test** (`tests/monolith.ark`) which demonstrates the core capabilities:
 
-```ark
+```rust
 // Define a GPU kernel
 fn[gpu] add_kernel(A: f32, B: f32) -> f32 {
     return A + B;
