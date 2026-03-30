@@ -23,24 +23,21 @@ FetchContent_MakeAvailable(CLI11)
 FetchContent_MakeAvailable(tomlplusplus)
 
 # =========================================================
-# 2. LLVM / MLIR feature detection
+# 2. Imported-target / LLVM artifact helpers
 # =========================================================
-#
-# Release must only compile and link features whose artifacts actually exist.
-# This file therefore computes concrete feature booleans and uses them to
-# control:
-#   - source selection
-#   - link libraries
-#   - compile definitions consumed by source code
-#
-
-function(ark_has_imported_artifact_release out_var target_name)
+function(ark_has_imported_artifact out_var target_name)
   set(_ok FALSE)
 
   if(TARGET ${target_name})
     foreach(_prop
       IMPORTED_IMPLIB_RELEASE
       IMPORTED_LOCATION_RELEASE
+      IMPORTED_IMPLIB_RELWITHDEBINFO
+      IMPORTED_LOCATION_RELWITHDEBINFO
+      IMPORTED_IMPLIB_MINSIZEREL
+      IMPORTED_LOCATION_MINSIZEREL
+      IMPORTED_IMPLIB_NOCONFIG
+      IMPORTED_LOCATION_NOCONFIG
       IMPORTED_IMPLIB
       IMPORTED_LOCATION
     )
@@ -55,21 +52,39 @@ function(ark_has_imported_artifact_release out_var target_name)
   set(${out_var} ${_ok} PARENT_SCOPE)
 endfunction()
 
-function(ark_append_target_if_release list_var target_name)
-  if(TARGET ${target_name})
-    ark_has_imported_artifact_release(_ark_has_release ${target_name})
-    if(_ark_has_release)
-      list(APPEND ${list_var} ${target_name})
-      set(${list_var} "${${list_var}}" PARENT_SCOPE)
-    else()
-      message(STATUS "[Ark] Release artifact missing: skipping ${target_name}")
-    endif()
-  else()
-    message(STATUS "[Ark] Package target missing: skipping ${target_name}")
+function(ark_require_imported_target list_var target_name)
+  if(NOT TARGET ${target_name})
+    message(FATAL_ERROR "[Ark] Required package target missing: ${target_name}")
   endif()
+
+  ark_has_imported_artifact(_ark_has_artifact ${target_name})
+  if(NOT _ark_has_artifact)
+    message(FATAL_ERROR "[Ark] Required imported target has no usable artifact: ${target_name}")
+  endif()
+
+  list(APPEND ${list_var} ${target_name})
+  set(${list_var} "${${list_var}}" PARENT_SCOPE)
 endfunction()
 
-function(ark_llvm_release_lib_exists out_var lib_basename)
+function(ark_append_imported_target_if_available list_var target_name)
+  if(NOT TARGET ${target_name})
+    message(STATUS "[Ark] Optional package target missing: ${target_name}")
+    set(${list_var} "${${list_var}}" PARENT_SCOPE)
+    return()
+  endif()
+
+  ark_has_imported_artifact(_ark_has_artifact ${target_name})
+  if(NOT _ark_has_artifact)
+    message(STATUS "[Ark] Optional imported target has no usable artifact: ${target_name}")
+    set(${list_var} "${${list_var}}" PARENT_SCOPE)
+    return()
+  endif()
+
+  list(APPEND ${list_var} ${target_name})
+  set(${list_var} "${${list_var}}" PARENT_SCOPE)
+endfunction()
+
+function(ark_llvm_lib_exists out_var lib_basename)
   set(_ok FALSE)
   set(_dirs "")
 
@@ -101,14 +116,16 @@ function(ark_llvm_release_lib_exists out_var lib_basename)
   set(${out_var} ${_ok} PARENT_SCOPE)
 endfunction()
 
+# =========================================================
+# 3. LLVM / MLIR surface
+# =========================================================
+
 # ---------------------------------------------------------
-# 2.a LLVM base surface
+# 3.a LLVM base surface
 # ---------------------------------------------------------
 set(LLVM_LINK_COMPONENTS
   Support
   Core
-  OrcJIT
-  ExecutionEngine
   Target
   native
   nativecodegen
@@ -121,23 +138,10 @@ set(LLVM_LINK_COMPONENTS
   TransformUtils
 )
 
-if(ARK_ENABLE_NVPTX)
-  list(APPEND LLVM_LINK_COMPONENTS NVPTX)
-endif()
-
-if(ARK_ENABLE_AMDGPU)
-  list(APPEND LLVM_LINK_COMPONENTS AMDGPU)
-endif()
-
-list(REMOVE_DUPLICATES LLVM_LINK_COMPONENTS)
-llvm_map_components_to_libnames(llvm_libs ${LLVM_LINK_COMPONENTS})
-
-# ---------------------------------------------------------
-# 2.b Optional LLVM host JIT
-# ---------------------------------------------------------
-ark_has_imported_artifact_release(ARK_HAVE_LLVM_ORCJIT LLVMOrcJIT)
-ark_has_imported_artifact_release(ARK_HAVE_LLVM_EXECUTIONENGINE LLVMExecutionEngine)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_EXECUTIONENGINE MLIRExecutionEngine)
+# Host JIT stays optional, but if present we use it.
+ark_has_imported_artifact(ARK_HAVE_LLVM_ORCJIT LLVMOrcJIT)
+ark_has_imported_artifact(ARK_HAVE_LLVM_EXECUTIONENGINE LLVMExecutionEngine)
+ark_has_imported_artifact(ARK_HAVE_MLIR_EXECUTIONENGINE MLIRExecutionEngine)
 
 set(ARK_ENABLE_HOST_JIT OFF)
 if(ARK_HAVE_LLVM_ORCJIT AND ARK_HAVE_LLVM_EXECUTIONENGINE AND ARK_HAVE_MLIR_EXECUTIONENGINE)
@@ -152,22 +156,22 @@ else()
 endif()
 
 # ---------------------------------------------------------
-# 2.c Optional LLVM GPU backends
+# 3.b GPU backend detection
 # ---------------------------------------------------------
 set(ARK_HAVE_LLVM_NVPTX_BACKEND OFF)
 if(ARK_ENABLE_NVPTX)
   list(FIND LLVM_TARGETS_TO_BUILD "NVPTX" _ark_has_nvptx_metadata)
   if(_ark_has_nvptx_metadata GREATER -1)
-    ark_llvm_release_lib_exists(_ark_has_nvptx_codegen LLVMNVPTXCodeGen)
+    ark_llvm_lib_exists(_ark_has_nvptx_codegen LLVMNVPTXCodeGen)
     if(_ark_has_nvptx_codegen)
       set(ARK_HAVE_LLVM_NVPTX_BACKEND ON)
       list(APPEND LLVM_LINK_COMPONENTS NVPTX)
       message(STATUS "[Ark][GPU] NVPTX backend enabled")
     else()
-      message(STATUS "[Ark][GPU] NVPTX backend disabled: missing Release LLVMNVPTXCodeGen")
+      message(FATAL_ERROR "[Ark][GPU] NVPTX requested but Release LLVMNVPTXCodeGen was not found")
     endif()
   else()
-    message(STATUS "[Ark][GPU] NVPTX backend disabled: not present in LLVM_TARGETS_TO_BUILD")
+    message(FATAL_ERROR "[Ark][GPU] NVPTX requested but is absent from LLVM_TARGETS_TO_BUILD")
   endif()
 endif()
 
@@ -175,16 +179,16 @@ set(ARK_HAVE_LLVM_AMDGPU_BACKEND OFF)
 if(ARK_ENABLE_AMDGPU)
   list(FIND LLVM_TARGETS_TO_BUILD "AMDGPU" _ark_has_amdgpu_metadata)
   if(_ark_has_amdgpu_metadata GREATER -1)
-    ark_llvm_release_lib_exists(_ark_has_amdgpu_codegen LLVMAMDGPUCodeGen)
+    ark_llvm_lib_exists(_ark_has_amdgpu_codegen LLVMAMDGPUCodeGen)
     if(_ark_has_amdgpu_codegen)
       set(ARK_HAVE_LLVM_AMDGPU_BACKEND ON)
       list(APPEND LLVM_LINK_COMPONENTS AMDGPU)
       message(STATUS "[Ark][GPU] AMDGPU backend enabled")
     else()
-      message(STATUS "[Ark][GPU] AMDGPU backend disabled: missing Release LLVMAMDGPUCodeGen")
+      message(FATAL_ERROR "[Ark][GPU] AMDGPU requested but Release LLVMAMDGPUCodeGen was not found")
     endif()
   else()
-    message(STATUS "[Ark][GPU] AMDGPU backend disabled: not present in LLVM_TARGETS_TO_BUILD")
+    message(FATAL_ERROR "[Ark][GPU] AMDGPU requested but is absent from LLVM_TARGETS_TO_BUILD")
   endif()
 endif()
 
@@ -192,44 +196,63 @@ list(REMOVE_DUPLICATES LLVM_LINK_COMPONENTS)
 llvm_map_components_to_libnames(llvm_libs ${LLVM_LINK_COMPONENTS})
 
 # ---------------------------------------------------------
-# 2.d Optional MLIR conversion / GPU surface
+# 3.c Required MLIR surface for compiler tools
 # ---------------------------------------------------------
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_VECTOR_TO_LLVM               MLIRVectorToLLVM)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_GPU_TRANSFORMS               MLIRGPUTransforms)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_GPU_PIPELINES                MLIRGPUPipelines)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_GPU_TO_NVVM_TRANSFORMS       MLIRGPUToNVVMTransforms)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_GPU_TO_ROCDL_TRANSFORMS      MLIRGPUToROCDLTransforms)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_GPU_TO_LLVMIR_TRANSLATION    MLIRGPUToLLVMIRTranslation)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_NVVM_TO_LLVMIR_TRANSLATION   MLIRNVVMToLLVMIRTranslation)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_ROCDL_TO_LLVMIR_TRANSLATION  MLIRROCDLToLLVMIRTranslation)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_NVVMDIALECT                  MLIRNVVMDialect)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_ROCDLDIALECT                 MLIRROCDLDialect)
-ark_has_imported_artifact_release(ARK_HAVE_MLIR_NVVM_TO_LLVM                 MLIRNVVMToLLVM)
+set(ARK_REQUIRED_MLIR_LIBS)
 
-set(ARK_ENABLE_NVPTX_GPU_PIPELINE OFF)
-if(ARK_HAVE_LLVM_NVPTX_BACKEND AND
-   ARK_HAVE_MLIR_VECTOR_TO_LLVM AND
-   ARK_HAVE_MLIR_GPU_TRANSFORMS AND
-   ARK_HAVE_MLIR_GPU_PIPELINES AND
-   ARK_HAVE_MLIR_GPU_TO_NVVM_TRANSFORMS AND
-   ARK_HAVE_MLIR_GPU_TO_LLVMIR_TRANSLATION AND
-   ARK_HAVE_MLIR_NVVM_TO_LLVMIR_TRANSLATION AND
-   ARK_HAVE_MLIR_NVVMDIALECT AND
-   ARK_HAVE_MLIR_NVVM_TO_LLVM)
-  set(ARK_ENABLE_NVPTX_GPU_PIPELINE ON)
-endif()
+foreach(_mlir_target
+  MLIRIR
+  MLIRParser
+  MLIRSupport
+  MLIRPass
+  MLIRTransforms
+  MLIRTargetLLVMIRExport
+  MLIRBuiltinToLLVMIRTranslation
+  MLIRLLVMToLLVMIRTranslation
+  MLIRGPUToLLVMIRTranslation
+  MLIRNVVMToLLVMIRTranslation
+  MLIRROCDLToLLVMIRTranslation
+  MLIRCallInterfaces
+  MLIRAnalysis
+  MLIRDataLayoutInterfaces
 
-set(ARK_ENABLE_AMDGPU_GPU_PIPELINE OFF)
-if(ARK_HAVE_LLVM_AMDGPU_BACKEND AND
-   ARK_HAVE_MLIR_VECTOR_TO_LLVM AND
-   ARK_HAVE_MLIR_GPU_TRANSFORMS AND
-   ARK_HAVE_MLIR_GPU_PIPELINES AND
-   ARK_HAVE_MLIR_GPU_TO_ROCDL_TRANSFORMS AND
-   ARK_HAVE_MLIR_GPU_TO_LLVMIR_TRANSLATION AND
-   ARK_HAVE_MLIR_ROCDL_TO_LLVMIR_TRANSLATION AND
-   ARK_HAVE_MLIR_ROCDLDIALECT)
-  set(ARK_ENABLE_AMDGPU_GPU_PIPELINE ON)
-endif()
+  MLIRFuncDialect
+  MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRLLVMDialect
+  MLIRVectorDialect
+  MLIRTensorDialect
+  MLIRIndexDialect
+  MLIRUBDialect
+  MLIRGPUDialect
+  MLIRNVVMDialect
+  MLIRROCDLDialect
+
+  MLIRFuncToLLVM
+  MLIRControlFlowToLLVM
+  MLIRArithToLLVM
+  MLIRMemRefToLLVM
+  MLIRIndexToLLVM
+  MLIRVectorToLLVM
+  MLIRLLVMCommonConversion
+  MLIRNVVMToLLVM
+  MLIRReconcileUnrealizedCasts
+  MLIRSCFToControlFlow
+  MLIRUBToLLVM
+  MLIRComplexToLLVM
+
+  MLIRGPUTransforms
+  MLIRGPUPipelines
+  MLIRGPUToNVVMTransforms
+  MLIRGPUToROCDLTransforms
+)
+  ark_require_imported_target(ARK_REQUIRED_MLIR_LIBS ${_mlir_target})
+endforeach()
+
+set(ARK_ENABLE_NVPTX_GPU_PIPELINE ${ARK_HAVE_LLVM_NVPTX_BACKEND})
+set(ARK_ENABLE_AMDGPU_GPU_PIPELINE ${ARK_HAVE_LLVM_AMDGPU_BACKEND})
 
 set(ARK_ENABLE_GPU_LOWERING OFF)
 if(ARK_ENABLE_NVPTX_GPU_PIPELINE OR ARK_ENABLE_AMDGPU_GPU_PIPELINE)
@@ -242,8 +265,13 @@ else()
   message(STATUS "[Ark][GPU] GPU lowering disabled")
 endif()
 
+set(ARK_HOST_JIT_MLIR_LIBS)
+if(ARK_ENABLE_HOST_JIT)
+  ark_require_imported_target(ARK_HOST_JIT_MLIR_LIBS MLIRExecutionEngine)
+endif()
+
 # =========================================================
-# 3. Runtime (Core + Platform Split)
+# 4. Runtime (Core + Platform Split)
 # =========================================================
 set(RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Runtime")
 
@@ -255,8 +283,8 @@ set(RUNTIME_COMMON_SOURCES
   "${RUNTIME_DIR}/core/panic.cpp"
   "${RUNTIME_DIR}/core/hash.cpp"
   "${RUNTIME_DIR}/core/vector.cpp"
-  "${RUNTIME_DIR}/net/remote.cpp"
   "${RUNTIME_DIR}/core/gpu_hal.cpp"
+  "${RUNTIME_DIR}/net/remote.cpp"
 )
 
 set(RUNTIME_PLATFORM_SOURCES)
@@ -292,7 +320,7 @@ set(RUNTIME_CORE_SOURCES
 )
 
 # =========================================================
-# 4. Config Header
+# 5. Config Header
 # =========================================================
 configure_file(
   "${RUNTIME_DIR}/include/ark_config.h.in"
@@ -300,7 +328,7 @@ configure_file(
 )
 
 # =========================================================
-# 5. GenMIR Reorganization
+# 6. GenMIR Reorganization
 # =========================================================
 set(ARK_GENMIR_SOURCES
   Frontend/GenMIR/GenMIR.Utils.cpp
@@ -308,7 +336,7 @@ set(ARK_GENMIR_SOURCES
 )
 
 # =========================================================
-# 6. Shared Compiler Sources
+# 7. Shared Compiler Sources
 # =========================================================
 set(ARK_COMPILER_SHARED_SOURCES
   hud.cpp
@@ -317,7 +345,6 @@ set(ARK_COMPILER_SHARED_SOURCES
   Pipeline/Compiler.cpp
   Pipeline/Linker.cpp
   Pipeline/LinkerGpuFatbin.cpp
-  Pipeline/JIT.cpp
   Integration/CapsuleBackend.cpp
 
   # Frontend
@@ -347,8 +374,6 @@ set(ARK_COMPILER_SHARED_SOURCES
   ${RUNTIME_CORE_SOURCES}
 )
 
-# Host JIT must always provide a TU for JIT::Run. Use a disabled TU when the
-# real host-JIT implementation is unavailable.
 if(ARK_ENABLE_HOST_JIT)
   list(APPEND ARK_COMPILER_SHARED_SOURCES
     Pipeline/JIT.cpp
@@ -359,19 +384,8 @@ else()
   )
 endif()
 
-# GPU lowering sources are only compiled when the full Release GPU conversion
-# surface exists.
-if(ARK_ENABLE_GPU_LOWERING)
-  list(APPEND ARK_COMPILER_SHARED_SOURCES
-    Pipeline/LinkerGpuFatbin.cpp
-    Transforms/GpuLowering.cpp
-    Transforms/GpuKernelOutlining.cpp
-    Transforms/RuntimeABIVerifier.cpp
-  )
-endif()
-
 # =========================================================
-# 7. Build Targets (arkc & arknet)
+# 8. Build Targets (arkc & arknet)
 # =========================================================
 add_ark_tool(arkc
   main.cpp
@@ -392,7 +406,7 @@ add_ark_tool(arknet
 )
 
 # =========================================================
-# 8. Common Target Configuration
+# 9. Common Target Configuration
 # =========================================================
 function(ark_fix_msvc_cpp_mode target_name)
   if(NOT MSVC)
@@ -435,84 +449,10 @@ function(ark_fix_msvc_cpp_mode target_name)
   target_compile_options(${target_name} PRIVATE /EHsc /GR)
 endfunction()
 
-# ---------------------------------------------------------
-# 8.a Common MLIR link surface
-# ---------------------------------------------------------
-set(ARK_COMMON_MLIR_LIBS)
-
-foreach(_mlir_target
-  MLIRIR
-  MLIRParser
-  MLIRSupport
-  MLIRPass
-  MLIRTransforms
-  MLIRTargetLLVMIRExport
-  MLIRBuiltinToLLVMIRTranslation
-  MLIRLLVMToLLVMIRTranslation
-  MLIRCallInterfaces
-  MLIRAnalysis
-  MLIRDataLayoutInterfaces
-  MLIRUBToLLVM
-  MLIRComplexToLLVM
-  MLIRFuncDialect
-  MLIRArithDialect
-  MLIRControlFlowDialect
-  MLIRMemRefDialect
-  MLIRSCFDialect
-  MLIRLLVMDialect
-  MLIRVectorDialect
-  MLIRTensorDialect
-)
-  ark_append_target_if_release(ARK_COMMON_MLIR_LIBS ${_mlir_target})
-endforeach()
-
-# GPU MLIR surface is appended only if GPU lowering is actually enabled.
-set(ARK_GPU_MLIR_LIBS)
-if(ARK_ENABLE_GPU_LOWERING)
-  foreach(_mlir_target
-    MLIRVectorToLLVM
-    MLIRGPUDialect
-    MLIRNVVMDialect
-    MLIRROCDLDialect
-    MLIRNVVMToLLVM
-    MLIRGPUTransforms
-    MLIRGPUPipelines
-    MLIRGPUToLLVMIRTranslation
-    MLIRFuncToLLVM
-    MLIRControlFlowToLLVM
-    MLIRArithToLLVM
-    MLIRLLVMCommonConversion
-    MLIRReconcileUnrealizedCasts
-    MLIRSCFToControlFlow
-    MLIRMemRefToLLVM
-    MLIRIndexToLLVM
-  )
-    ark_append_target_if_release(ARK_GPU_MLIR_LIBS ${_mlir_target})
-  endforeach()
-
-  if(ARK_ENABLE_NVPTX_GPU_PIPELINE)
-    foreach(_mlir_target
-      MLIRGPUToNVVMTransforms
-      MLIRNVVMToLLVMIRTranslation
-    )
-      ark_append_target_if_release(ARK_GPU_MLIR_LIBS ${_mlir_target})
-    endforeach()
-  endif()
-
-  if(ARK_ENABLE_AMDGPU_GPU_PIPELINE)
-    foreach(_mlir_target
-      MLIRGPUToROCDLTransforms
-      MLIRROCDLToLLVMIRTranslation
-    )
-      ark_append_target_if_release(ARK_GPU_MLIR_LIBS ${_mlir_target})
-    endforeach()
-  endif()
-endif()
-
-# Host-JIT MLIR surface.
-set(ARK_HOST_JIT_MLIR_LIBS)
-if(ARK_ENABLE_HOST_JIT)
-  ark_append_target_if_release(ARK_HOST_JIT_MLIR_LIBS MLIRExecutionEngine)
+if(DEFINED LLVM_DIR AND NOT LLVM_DIR STREQUAL "")
+  get_filename_component(ARK_DEFAULT_LLVM_BIN_DIR "${LLVM_DIR}/../../../bin" ABSOLUTE)
+else()
+  set(ARK_DEFAULT_LLVM_BIN_DIR "")
 endif()
 
 foreach(TOOL_TARGET arkc arknet)
@@ -546,54 +486,8 @@ foreach(TOOL_TARGET arkc arknet)
     ArkToLLVM
 
     ${llvm_libs}
-
-    MLIRIR
-    MLIRParser
-    MLIRSupport
-    MLIRPass
-    MLIRTransforms
-    MLIRExecutionEngine
-    MLIRTargetLLVMIRExport
-    MLIRBuiltinToLLVMIRTranslation
-    MLIRLLVMToLLVMIRTranslation
-    MLIRGPUToLLVMIRTranslation
-    MLIRNVVMToLLVMIRTranslation
-    MLIRROCDLToLLVMIRTranslation
-
-    MLIRCallInterfaces
-    MLIRAnalysis
-    MLIRDataLayoutInterfaces
-
-    MLIRFuncDialect
-    MLIRArithDialect
-    MLIRControlFlowDialect
-    MLIRMemRefDialect
-    MLIRSCFDialect
-    MLIRLLVMDialect
-    MLIRVectorDialect
-    MLIRTensorDialect
-    MLIRGPUDialect
-    MLIRNVVMDialect
-    MLIRROCDLDialect
-    MLIRIndexDialect
-
-    MLIRFuncToLLVM
-    MLIRControlFlowToLLVM
-    MLIRArithToLLVM
-    MLIRMemRefToLLVM
-    MLIRIndexToLLVM
-    MLIRVectorToLLVM
-    MLIRLLVMCommonConversion
-    MLIRNVVMToLLVM
-    MLIRReconcileUnrealizedCasts
-    MLIRSCFToControlFlow
-    MLIRUBToLLVM
-    MLIRComplexToLLVM
-
-    MLIRGPUTransforms
-    MLIRGPUPipelines
-    MLIRGPUToNVVMTransforms
-    MLIRGPUToROCDLTransforms
+    ${ARK_REQUIRED_MLIR_LIBS}
+    ${ARK_HOST_JIT_MLIR_LIBS}
 
     ${ARK_PLATFORM_LINK_LIBS}
     ${ARK_PLATFORM_DL_LIBS}
@@ -623,6 +517,16 @@ foreach(TOOL_TARGET arkc arknet)
     target_compile_definitions(${TOOL_TARGET} PRIVATE ARK_ENABLE_AMDGPU_GPU_PIPELINE=0)
   endif()
 
+  if(ARK_DEFAULT_LLVM_BIN_DIR)
+    target_compile_definitions(${TOOL_TARGET} PRIVATE
+      ARK_DEFAULT_LLVM_BIN_DIR="${ARK_DEFAULT_LLVM_BIN_DIR}"
+    )
+  endif()
+
+  target_compile_definitions(${TOOL_TARGET} PRIVATE
+    ARK_RUNTIME_SOURCE_DIR="${RUNTIME_DIR}"
+  )
+
   if(UNIX AND NOT APPLE)
     target_link_options(${TOOL_TARGET} PRIVATE "-rdynamic")
   elseif(APPLE)
@@ -635,10 +539,13 @@ foreach(TOOL_TARGET arkc arknet)
 
 endforeach()
 
-target_link_libraries(arknet PRIVATE CLI11::CLI11 tomlplusplus::tomlplusplus)
+target_link_libraries(arknet PRIVATE
+  CLI11::CLI11
+  tomlplusplus::tomlplusplus
+)
 
 # =========================================================
-# 9. Build the Capsule Stub (ark-stub)
+# 10. Build the Capsule Stub (ark-stub)
 # =========================================================
 add_executable(ark-stub Runner/Stub.cpp)
 target_compile_definitions(ark-stub PRIVATE ARK_STUB_STANDALONE)
@@ -676,12 +583,12 @@ else()
 endif()
 
 # =========================================================
-# 10. Installation
+# 11. Installation
 # =========================================================
 install(TARGETS arkc arknet ark-stub DESTINATION bin)
 
 # =========================================================
-# 11. Runtime Headers Preparation
+# 12. Runtime Headers Preparation
 # =========================================================
 add_custom_target(PrepareRuntimeHeaders ALL
   COMMENT "Copying Protocol & ABI headers to Runtime/include..."
@@ -697,6 +604,6 @@ add_custom_target(PrepareRuntimeHeaders ALL
 )
 
 # =========================================================
-# 12. GPU Plugins (SHARED)
+# 13. GPU Plugins (SHARED)
 # =========================================================
 add_subdirectory(Runtime/gpu)
