@@ -526,10 +526,6 @@ mlir::LogicalResult GenMIR::lowerCpuKernel(const Function &fn) {
 }
 
 
-
-
-
-
 // =============================================================================
 // Vector Method Lowering
 // Handles: vec.push(val), vec.len, vec.cap
@@ -1376,8 +1372,6 @@ mlir::FailureOr<RValue> GenMIR::lowerAwait(const AwaitExpr &aw) {
 
     return RValue{st, alive};
 }
-
-
 
 
 // =============================================================================
