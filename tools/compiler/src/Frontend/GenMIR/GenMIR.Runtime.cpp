@@ -1,4 +1,4 @@
-#include "Frontend/GenMIR/GenMIR.Runtime.h"
+#include "ark/compiler/Frontend/GenMIR/GenMIR.Runtime.hpp"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinTypes.h"

@@ -332,7 +332,12 @@ configure_file(
 # 6. GenMIR Reorganization
 # =========================================================
 set(ARK_GENMIR_SOURCES
+  src/Frontend/GenMIR/GenMIR.Runtime.cpp
+  src/Frontend/GenMIR/GenMIR.Types.cpp
+  src/Frontend/GenMIR/GenMIR.GPU.cpp
   src/Frontend/GenMIR/GenMIR.Utils.cpp
+  src/Frontend/GenMIR/GenMIR.Schema.cpp
+  src/Frontend/GenMIR/GenMIR.Intrinsics.cpp
   src/Frontend/GenMIR.cpp
 )
 
@@ -390,7 +395,6 @@ endif()
 # =========================================================
 add_ark_tool(arknet
   src/CLI/Main.cpp
-  src/CLI/Main.cpp
   src/CLI/Init.cpp
   src/CLI/Common.cpp
   src/CLI/Compile.cpp
@@ -402,6 +406,7 @@ add_ark_tool(arknet
   src/CLI/Workspace.cpp
   ${ARK_COMPILER_SHARED_SOURCES}
 )
+
 # =========================================================
 # 9. Common Target Configuration
 # =========================================================

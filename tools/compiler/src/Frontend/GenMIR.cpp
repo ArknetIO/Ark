@@ -1,4 +1,7 @@
 #include "ark/compiler/Frontend/GenMIR.hpp"
+#include "ark/compiler/Frontend/GenMIR/GenMIR.Utils.hpp"
+#include "ark/compiler/Frontend/GenMIR/GenMIR.Runtime.hpp"
+#include "ark/compiler/Frontend/GenMIR/GenMIR.Types.hpp"
 
 #include "ark/IR/ArkMirOps.h"
 #include "ark/IR/ArkMirTypes.h" 
@@ -33,98 +36,6 @@ using namespace arklang;
 using namespace arklang::mir;
 
 
-
-
-// ============================================ .Utils =================================================
-
-mlir::Value getOrCreateGlobalString(mlir::Location loc,
-                                    mlir::OpBuilder &funcBuilder,
-                                    mlir::ModuleOp module,
-                                    llvm::StringRef content);
-
-mlir::Value constBool(mlir::OpBuilder &builder, mlir::Location loc, bool val);
-
-mlir::LLVM::LLVMFuncOp getOrDeclPrintf(mlir::ModuleOp module, mlir::OpBuilder &builder);
-
-void emitPrintf(mlir::OpBuilder &b,
-                mlir::Location loc,
-                mlir::ModuleOp mod,
-                llvm::StringRef fmt,
-                mlir::ValueRange args);
-
-mlir::LLVM::LLVMFuncOp getOrDeclareArkLaunch(mlir::ModuleOp module,
-                                             mlir::OpBuilder &builder,
-                                             mlir::Location loc);
-
-mlir::LLVM::LLVMFuncOp getOrDeclareArkGpuLaunch(mlir::ModuleOp module,
-                                                mlir::OpBuilder &builder,
-                                                mlir::Location loc);
-
-mlir::Value castPtrTo(mlir::OpBuilder &b,
-                      mlir::Location loc,
-                      mlir::Value ptr,
-                      mlir::Type expectedPtrTy);
-
-mlir::Value castToExpectedPtr(mlir::OpBuilder &b,
-                              mlir::Location loc,
-                              mlir::Value v,
-                              mlir::Type expectedPtrTy);
-
-mlir::Type getUnitType(mlir::OpBuilder &b);
-mlir::Value getUnitUndef(mlir::OpBuilder &b, mlir::Location loc);
-
-bool isTensorType(const arklang::Type &ty);
-bool containsReturn(const Expr &e);
-
-mlir::FailureOr<mlir::Block *> splitBlockAt(mlir::OpBuilder &b,
-                                            mlir::Location loc,
-                                            mlir::Block *cur);
-
-mlir::LLVM::LLVMFuncOp getOrDeclRuntimeFn(mlir::ModuleOp module,
-                                          mlir::OpBuilder &b,
-                                          mlir::Location loc,
-                                          llvm::StringRef name,
-                                          mlir::Type retTy,
-                                          llvm::ArrayRef<mlir::Type> argTys,
-                                          bool isVarArg = false);
-
-std::string astTypeToString(const arklang::Type &t);
-bool isGpuSafeIntrinsic(llvm::StringRef rawName);
-
-mlir::FailureOr<std::string> mangleCanonicalType(mlir::Type t);
-
-arklang::Type substituteTypeParams(const arklang::Type &src,
-                                   const llvm::StringMap<arklang::Type> &subst);
-
-std::string mangleArg(const arklang::Type &t);
-
-std::string mangleGenericName(llvm::StringRef baseName,
-                              llvm::ArrayRef<arklang::Type> args);
-
-std::string llvmStructNameFor(llvm::StringRef arkName);
-
-
-
-
-// ============================================ .Runtime =================================================
-
-
-
-
-
-
-
-
-
-
-
-
-static std::string typeToString(mlir::Type type) {
-    std::string typeStr;
-    llvm::raw_string_ostream os(typeStr);
-    type.print(os);
-    return os.str();
-}
 
 // =============================================================================
 // Vector/Runtime Helpers
@@ -169,606 +80,10 @@ static mlir::LLVM::LLVMFuncOp getOrCreateFunc(mlir::ModuleOp module,
     return fn;
 }
 
-
-// -----------------------------------------------------------------------------
-// GenMIR Support: Safety & Intrinsics
-// -----------------------------------------------------------------------------
-
-mlir::func::FuncOp GenMIR::getOrCreatePanicFn() {
-    static constexpr llvm::StringLiteral kName = "__ark_panic";
-    if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(kName)) return fn;
-
-    mlir::OpBuilder::InsertionGuard g(builder);
-    builder.setInsertionPointToStart(module.getBody());
-
-    // [FIX 1] Opaque Pointers: Pass Context, not Element Type
-    auto i8Ptr = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-    
-    // [FIX 2] Explicit TypeRange construction to satisfy overload resolution
-    auto fnTy  = builder.getFunctionType(mlir::TypeRange{i8Ptr}, mlir::TypeRange{});
-    
-    auto fn    = builder.create<mlir::func::FuncOp>(builder.getUnknownLoc(), kName, fnTy);
-    fn.setPrivate();
-    return fn;
-}
-
-// Host-side assertion logic
-void GenMIR::emitHostAssert(mlir::Location loc, mlir::Value condI1, llvm::StringRef msg) {
-    // We want to panic if condition is FALSE.
-    auto one = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 1);
-    mlir::Value isBad = builder.create<mlir::arith::XOrIOp>(loc, condI1, one);
-
-    auto ifOp = builder.create<mlir::scf::IfOp>(loc, isBad, /*withElse=*/false);
-    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-    
-    auto cstr = getOrCreateGlobalString(loc, builder, module, msg.str());
-    emitPanic(loc, cstr);
-    
-    builder.setInsertionPointAfter(ifOp);
-}
-
-void GenMIR::assertParBoundsHost(mlir::Location loc, mlir::Value startI64, mlir::Value limitI64) {
-    auto zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
-
-    // 1. Start >= 0
-    auto startNonNeg = builder.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::sge, startI64, zero);
-    emitHostAssert(loc, startNonNeg, "par: start must be >= 0");
-
-    // 2. Limit >= 0
-    auto limitNonNeg = builder.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::sge, limitI64, zero);
-    emitHostAssert(loc, limitNonNeg, "par: limit must be >= 0");
-
-    // 3. Limit >= Start
-    auto limitGeStart = builder.create<mlir::arith::CmpIOp>(
-        loc, mlir::arith::CmpIPredicate::sge, limitI64, startI64);
-    emitHostAssert(loc, limitGeStart, "par: limit must be >= start");
-}
-
-// Type-Stable Intrinsic Creator
-mlir::FailureOr<mlir::func::FuncOp> GenMIR::getOrCreateIntrinsic(mlir::Location loc, llvm::StringRef base, mlir::Type argTy, mlir::TypeRange resTys) {
-    auto suffixOr = mangleCanonicalType(argTy);
-    if (mlir::failed(suffixOr)) return mlir::failure();
-
-    std::string name = (base + "_" + *suffixOr).str();
-
-    if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name)) {
-        auto want = builder.getFunctionType({argTy}, resTys);
-        if (existing.getFunctionType() != want) return mlir::failure(); // Type conflict
-        return existing;
-    }
-
-    mlir::OpBuilder::InsertionGuard g(builder);
-    builder.setInsertionPointToStart(module.getBody());
-    auto fnTy = builder.getFunctionType({argTy}, resTys);
-    auto fn = builder.create<mlir::func::FuncOp>(builder.getUnknownLoc(), name, fnTy);
-    fn.setPrivate();
-    return fn;
-}
-
-
-mlir::FailureOr<GenMIR::DimsResult> GenMIR::getDimsFromCall(mlir::Location loc, const CallExpr& call) {
-    if (call.args.size() != 1) return mlir::failure();
-    auto vOr = lowerExpr(*call.args[0].value);
-    if (mlir::failed(vOr)) return mlir::failure();
-    mlir::Value v = vOr->val;
-
-    mlir::Type i64Ty = builder.getI64Type();
-    auto fnOr = getOrCreateIntrinsic(loc, "__ark_intrinsic_dims", v.getType(), mlir::TypeRange{i64Ty, i64Ty});
-    if (mlir::failed(fnOr)) return mlir::failure();
-
-    auto callOp = builder.create<mlir::func::CallOp>(loc, *fnOr, mlir::ValueRange{v});
-    return DimsResult{callOp.getResult(0), callOp.getResult(1)};
-}
-
-// Exhaustive GPU Legality Checker
-bool GenMIR::checkGpuLegality(const Expr& e, std::string& outError) {
-    auto illegal = [&](llvm::StringRef msg) { outError = msg.str(); return true; };
-
-    // 1. Forbidden Roots
-    if (e.kind == ExprKind::Return) return illegal("Return forbidden in GPU kernel");
-    if (e.kind == ExprKind::Await)  return illegal("Await forbidden in GPU kernel");
-    if (e.kind == ExprKind::Alloc)  return illegal("Host alloc forbidden in GPU kernel");
-    if (e.kind == ExprKind::Import) return illegal("Import forbidden in GPU kernel");
-    if (e.kind == ExprKind::Launch) return illegal("Dynamic launch forbidden in GPU kernel");
-    if (e.kind == ExprKind::Print)  return illegal("Print forbidden in GPU kernel");
-    
-    // Member calls are effectively indirect calls to host code unless proven otherwise
-    if (e.kind == ExprKind::MemberCall) {
-        return illegal("Method calls forbidden in GPU kernels (use standalone functions)");
-    }
-
-    // 2. Semantic Checks
-    if (e.kind == ExprKind::Call) {
-        auto& c = static_cast<const CallExpr&>(e);
-        // Scan args first
-        for (auto& a : c.args) if (checkGpuLegality(*a.value, outError)) return true;
-
-        auto* sym = dynamic_cast<const SymbolExpr*>(c.callee.get());
-        if (!sym) return illegal("Indirect call forbidden in GPU kernel");
-
-        if (arklang::isIntrinsicFn(sym->name)) {
-            if (!isGpuSafeIntrinsic(sym->name)) {
-                return illegal(("Intrinsic '" + sym->name + "' is not GPU-safe").c_str());
-            }
-            return false;
-        }
-
-        auto it = globalFunctionMap.find(sym->name);
-        if (it == globalFunctionMap.end()) {
-            return illegal(("Call to unknown symbol '" + sym->name + "'").c_str());
-        }
-        if (it->second->domain != Domain::GPU) {
-            return illegal(("Call to host function '" + sym->name + "'").c_str());
-        }
-        return false;
-    }
-
-    // 3. Structural Traversal
-    auto scan = [&](const Expr* sub) { return sub && checkGpuLegality(*sub, outError); };
-    auto scanList = [&](const auto& list) {
-        for (const auto& item : list) if (checkGpuLegality(*item, outError)) return true;
-        return false;
-    };
-
-    switch (e.kind) {
-        case ExprKind::Block: return scanList(static_cast<const BlockExpr&>(e).stmts);
-        case ExprKind::If: {
-            auto& s = static_cast<const IfStmt&>(e);
-            return scan(s.condition.get()) || scan(s.thenBranch.get()) || scan(s.elseBranch.get());
-        }
-        case ExprKind::Match: {
-            auto& s = static_cast<const MatchStmt&>(e);
-            if (scan(s.target.get())) return true;
-            for (const auto& c : s.cases) if (scan(c.body.get())) return true;
-            return false;
-        }
-        case ExprKind::While: return scan(static_cast<const WhileStmt&>(e).body.get());
-        case ExprKind::For:   return scan(static_cast<const ForStmt&>(e).body.get());
-        case ExprKind::ParLoop: return scan(static_cast<const ParLoop&>(e).body.get());
-        case ExprKind::Iter:  return scan(static_cast<const IterStmt&>(e).body.get());
-
-        case ExprKind::Binary: {
-            auto& bin = static_cast<const BinaryExpr&>(e);
-            return scan(bin.lhs.get()) || scan(bin.rhs.get());
-        }
-        case ExprKind::Assign: {
-            auto& a = static_cast<const AssignStmt&>(e);
-            return scan(a.target.get()) || scan(a.value.get());
-        }
-        case ExprKind::Index: return scan(static_cast<const IndexExpr&>(e).index.get());
-        case ExprKind::MemberAccess: return scan(static_cast<const MemberExpr&>(e).object.get());
-        case ExprKind::Tuple: return scanList(static_cast<const TupleExpr&>(e).elements);
-        case ExprKind::ArrayLiteral: return scanList(static_cast<const ArrayLiteral&>(e).elements);
-        case ExprKind::Range: {
-            auto& r = static_cast<const RangeExpr&>(e);
-            return scan(r.start.get()) || scan(r.end.get());
-        }
-        // Explicitly handle Unary (assuming UnaryExpr matches structure)
-        case ExprKind::Unary: {
-             // auto& u = static_cast<const UnaryExpr&>(e);
-             // return scan(u.operand.get());
-             return illegal("Unary traversal pending AST update"); 
-        }
-        case ExprKind::SchemaExpr: {
-            auto& s = static_cast<const SchemaExpr&>(e);
-            for(auto& f : s.fields) if(scan(f.value.get())) return true;
-            return false;
-        }
-
-        // Safe Leaves
-        case ExprKind::Lambda:
-        case ExprKind::Literal: 
-        case ExprKind::String:
-        case ExprKind::Symbol:
-            return false;
-            
-        // Conservative Default
-        default: 
-            return illegal("Unhandled node type in GPU checker");
-    }
-}
-
-
 static SourceLoc toSourceLoc(mlir::Location loc) { return SourceLoc{}; }
-
-// Helper to create a "Void" RValue that is considered "Alive" (Unit)
-static RValue unitAlive(mlir::OpBuilder &b, mlir::Location loc) {
-    auto trueVal = b.create<mlir::LLVM::ConstantOp>(loc, b.getI1Type(), b.getBoolAttr(true));
-    // We use Undef for void value, or a zero-sized struct
-    auto voidVal = b.create<mlir::LLVM::UndefOp>(loc, mlir::LLVM::LLVMVoidType::get(b.getContext()));
-    return RValue{voidVal, trueVal};
-}
-
 
 
 namespace arklang {
-
-
-
-// Helper: Ensure we have a container module for GPU code
-mlir::gpu::GPUModuleOp GenMIR::getOrCreateGpuModule() {
-    constexpr llvm::StringLiteral kSym = "ark.gpu.module";
-
-    if (auto op = module.lookupSymbol<mlir::gpu::GPUModuleOp>(kSym))
-        return op;
-
-    mlir::OpBuilder::InsertionGuard g(builder);
-    builder.setInsertionPointToStart(module.getBody());
-
-    // Create the module
-    auto gm = builder.create<mlir::gpu::GPUModuleOp>(builder.getUnknownLoc(), kSym);
-
-    // [FIX] Ensure the GPU module has a body block correctly.
-    // GPUModuleOp has a specific internal structure. 
-    // If the body is empty, we add a block so we can insert functions into it.
-    if (gm.getBodyRegion().empty()) {
-        gm.getBodyRegion().emplaceBlock();
-    }
-
-#if defined(ARK_ENABLE_CUDA)
-    gm->setAttr("ark.gpu.backend", builder.getStringAttr("cuda"));
-    // Consider making this dynamic based on the user's hardware
-    gm->setAttr("nvvm.target", builder.getStringAttr("sm_70")); 
-#elif defined(ARK_ENABLE_HIP)
-    gm->setAttr("ark.gpu.backend", builder.getStringAttr("hip"));
-#elif defined(ARK_ENABLE_METAL)
-    gm->setAttr("ark.gpu.backend", builder.getStringAttr("metal"));
-#endif
-
-    return gm;
-}
-
-
-// =============================================================================
-// GPU Host Stub Emission (Restored LLVMFuncOp & 1:1 Pointer Passing)
-// =============================================================================
-mlir::LogicalResult GenMIR::emitGpuHostStub(const Function &fn) {
-    mir->enterFunction();
-    mlir::Location loc = toLoc(fn.loc);
-
-    llvm::SmallVector<mlir::Type, 4> hostArgTypes;
-    for (const auto &argPair : fn.args) hostArgTypes.push_back(convertType(argPair.second));
-
-    auto voidTy = mlir::LLVM::LLVMVoidType::get(builder.getContext());
-    auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, hostArgTypes, false);
-    const std::string name = mangleFunction(fn.name, astModule);
-
-    mlir::OpBuilder::InsertionGuard g(builder);
-    builder.setInsertionPointToStart(module.getBody());
-    
-    // Must be LLVMFuncOp so `lowerAsyncLaunch` can find it!
-    auto funcOp = builder.create<mlir::LLVM::LLVMFuncOp>(loc, name, funcTy);
-
-    mlir::Block *entryBlock = funcOp.addEntryBlock(builder);
-    builder.setInsertionPointToStart(entryBlock);
-
-    auto voidPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-    auto i32Ty = builder.getI32Type();
-    mlir::Value one = builder.create<mlir::LLVM::ConstantOp>(loc, i32Ty, builder.getI32IntegerAttr(1));
-    mlir::Value zero = builder.create<mlir::LLVM::ConstantOp>(loc, i32Ty, builder.getI32IntegerAttr(0));
-
-    int totalArgSlots = fn.args.size();
-    mlir::Value argsArray;
-
-    if (totalArgSlots > 0) {
-        // Create an array of void pointers (void* array[N])
-        auto arrayTy = mlir::LLVM::LLVMArrayType::get(voidPtrTy, totalArgSlots);
-        argsArray = builder.create<mlir::LLVM::AllocaOp>(loc, voidPtrTy, arrayTy, one);
-
-        for (size_t i = 0; i < fn.args.size(); ++i) {
-            mlir::Value rawPtr = entryBlock->getArgument(i);
-
-            // 1. Allocate a local stack slot for this specific argument
-            mlir::Value pSlot = builder.create<mlir::LLVM::AllocaOp>(loc, voidPtrTy, rawPtr.getType(), one);
-            
-            // 2. Store the actual device pointer into the stack slot
-            builder.create<mlir::LLVM::StoreOp>(loc, rawPtr, pSlot);
-            
-            // 3. Get the address of argsArray[i]
-            mlir::Value pIdx = builder.create<mlir::LLVM::ConstantOp>(loc, i32Ty, builder.getI32IntegerAttr(i));
-            mlir::Value pGep = builder.create<mlir::LLVM::GEPOp>(loc, voidPtrTy, arrayTy, argsArray, mlir::ValueRange{zero, pIdx});
-            
-            // 4. Store the address of the stack slot (pSlot) into argsArray[i]
-            // This strictly satisfies the void** requirement for cuLaunchKernel
-            builder.create<mlir::LLVM::StoreOp>(loc, pSlot, pGep);
-        }
-    } else {
-        // Safe fallback for 0-argument kernels
-        argsArray = builder.create<mlir::LLVM::ZeroOp>(loc, voidPtrTy);
-    }
-
-    const std::string gpuKernelName = fn.name;
-    mlir::Value kernelNameStr = getOrCreateGlobalString(loc, builder, module, gpuKernelName);
-    
-    // Grid X = 32 blocks of 32 threads = 1024 total elements
-    mlir::Value dim1 = builder.create<mlir::LLVM::ConstantOp>(loc, i32Ty, builder.getI32IntegerAttr(1));
-    mlir::Value dim32 = builder.create<mlir::LLVM::ConstantOp>(loc, i32Ty, builder.getI32IntegerAttr(32));
-    mlir::Value finalSlotCount = builder.create<mlir::LLVM::ConstantOp>(loc, i32Ty, builder.getI32IntegerAttr(totalArgSlots));
-    
-    // [FIX] We must pass a NULL pointer for the ark_gpu_stream! 
-    mlir::Value nullStream = builder.create<mlir::LLVM::ZeroOp>(loc, voidPtrTy);
-
-    auto launchFn = getOrDeclareArkGpuLaunch(module, builder, loc);
-    mlir::Value argsPtrOpaque = builder.create<mlir::LLVM::BitcastOp>(loc, voidPtrTy, argsArray);
-
-    // [FIX] Pass exactly 10 arguments!
-    builder.create<mlir::LLVM::CallOp>(loc, launchFn, mlir::ValueRange{
-        kernelNameStr, argsPtrOpaque, finalSlotCount,
-        dim32, dim1, dim1, dim32, dim1, dim1, nullStream
-    });
-
-    builder.create<mlir::LLVM::ReturnOp>(loc, mlir::ValueRange{});
-    mir->exitFunction();
-    return mlir::success();
-}
-
-
-// =============================================================================
-// Device Kernel Emission (1:1 ABI Mapping & Global Address Space)
-// =============================================================================
-mlir::LogicalResult GenMIR::emitGpuDeviceKernel(const Function &fn) {
-    mlir::Location loc = toLoc(fn.loc);
-    mlir::gpu::GPUModuleOp gm = getOrCreateGpuModule();
-    if (gm.lookupSymbol<mlir::gpu::GPUFuncOp>(fn.name)) return mlir::success();
-
-    mlir::OpBuilder::InsertionGuard g(builder);
-    builder.setInsertionPointToEnd(gm.getBody());
-
-    llvm::SmallVector<mlir::Type, 8> argTys;
-    auto globalPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext(), 1); // AS 1 Global
-    auto localPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext(), 0);  // AS 0 Local/Private
-
-    // Exactly 1 pointer argument per tensor.
-    for (const auto &arg : fn.args) {
-        if (isTensorType(arg.second)) {
-            argTys.push_back(globalPtrTy);
-        } else {
-            argTys.push_back(convertType(arg.second));
-        }
-    }
-
-    auto funcTy = builder.getFunctionType(argTys, {}); 
-    auto k = builder.create<mlir::gpu::GPUFuncOp>(loc, fn.name, funcTy);
-    k->setAttr(mlir::gpu::GPUDialect::getKernelFuncAttrName(), builder.getUnitAttr());
-    k->setAttr("ark.gpu.kernel", builder.getUnitAttr());
-
-    mlir::Block *entry = k.getBody().empty() ? k.addEntryBlock() : &k.getBody().front();
-    if (entry->getNumArguments() == 0) {
-        for (auto ty : argTys) entry->addArgument(ty, loc);
-    }
-
-    builder.setInsertionPointToStart(entry);
-    const Domain prevDomain = currentFnDomain;
-    currentFnDomain = Domain::GPU;
-    mir->enterFunction();
-    mir->pushScope();
-
-    int argIdx = 0;
-    auto i64Ty = builder.getI64Type();
-
-    for (size_t i = 0; i < fn.args.size(); ++i) {
-        const std::string &name = fn.args[i].first;
-        arklang::Type astTy = fn.args[i].second;
-
-        if (isTensorType(astTy)) {
-            mlir::Value ptrArg = entry->getArgument(argIdx++); // The raw AS 1 device pointer
-            
-            // [FIX] Allocate a local stack slot (AS 0) to hold the device pointer.
-            // This turns the R-Value block argument into a valid L-Value for MIR!
-            mlir::Value one = builder.create<mlir::LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(1));
-            mlir::Value localSlot = builder.create<mlir::LLVM::AllocaOp>(loc, localPtrTy, globalPtrTy, one);
-            builder.create<mlir::LLVM::StoreOp>(loc, ptrArg, localSlot);
-
-            // Re-apply length for internal loop bounding (par i in C)
-            mlir::Value sizeArg = builder.create<mlir::LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(1024));
-
-            VarInfo info;
-            info.place = localSlot; // [FIX] Now point the environment to the local stack slot
-            info.len = sizeArg; 
-            info.valueTy = globalPtrTy;
-            info.astTy = astTy;
-            
-            info.elemTy = builder.getF32Type(); 
-            if (!astTy.genericArgs.empty()) {
-                info.elemTy = convertType(astTy.genericArgs[0]);
-            }
-            
-            info.state = constBool(builder, loc, true);
-            mir->defineVar(name, info); 
-        } else {
-            mlir::Value val = entry->getArgument(argIdx++);
-            // declareLocal handles the local allocation automatically for scalars
-            mir->declareLocal(loc, name, astTy, RValue{val, constBool(builder, loc, true)});
-        }
-    }
-
-    for (const auto &stmtPtr : fn.body) {
-        if (!stmtPtr || mlir::failed(lowerStmt(*stmtPtr))) return mlir::failure();
-    }
-
-    mlir::Block *curBlk = builder.getInsertionBlock();
-    if (curBlk && (curBlk->empty() || !curBlk->back().hasTrait<mlir::OpTrait::IsTerminator>())) {
-        builder.create<mlir::gpu::ReturnOp>(loc);
-    }
-
-    mir->popScope();
-    mir->exitFunction();
-    currentFnDomain = prevDomain;
-    return mlir::success();
-}
-
-
-// =============================================================================
-// Schema Resolution (AST Lookup)
-// =============================================================================
-const SchemaDecl* GenMIR::resolveSchemaAST(const std::string& name) {
-    // 1. Check Local Module (Primary Source)
-    if (astModule) {
-        for (const auto &s : astModule->schemas) {
-            if (s->name == name) return s.get();
-        }
-    }
-
-    // 2. Qualified Match (e.g. "math.Vec3")
-    size_t dotPos = name.find('.');
-    if (dotPos != std::string::npos) {
-        std::string alias = name.substr(0, dotPos);       // "math"
-        std::string typeName = name.substr(dotPos + 1);   // "Vec3"
-
-        if (importedModules.count(alias)) {
-            const Module* mod = importedModules[alias];
-            for (const auto& s : mod->schemas) {
-                if (s->name == typeName) return s.get();
-            }
-        }
-    }
-
-    // 3. Fallback to Global Map (if you maintain a separate registry)
-    //    Note: This is usually redundant if astModule covers the current compilation unit.
-    if (globalSchemaMap.count(name)) return globalSchemaMap[name];
-
-    return nullptr;
-}
-
-
-// =============================================================================
-// Type Coercion Helper
-// Handles implicit casts (e.g. i32 -> i64, int -> float)
-// NOTE: LLVM void is not a value type. If targetType is void, we drop the value
-//       and return an empty mlir::Value (never fabricate undef void).
-// =============================================================================
-mlir::Value GenMIR::coerce(mlir::OpBuilder &b, mlir::Location loc, mlir::Value val, mlir::Type targetType) {
-    if (!val) {
-        mlir::emitError(loc) << "coerce: null input value (to " << targetType << ")";
-        return {};
-    }
-
-    mlir::Type currentType = val.getType();
-    if (currentType == targetType) return val;
-
-    // [FIX] Guard for High-Level MLIR Types (MemRef)
-    // MemRefs are not primitive LLVM types and do not have a bit-width.
-    // If we are passing a MemRef to a function/local that expects the same MemRef,
-    // the 'currentType == targetType' check above handles it. 
-    // If they differ, we simply return the value as-is and let the caller or 
-    // specialized lowering handle it (standard for Tensor/Slice mapping).
-    if (llvm::isa<mlir::MemRefType>(currentType) || llvm::isa<mlir::MemRefType>(targetType)) {
-        return val;
-    }
-
-    auto isVoidTy = [](mlir::Type ty) -> bool {
-        return llvm::isa<mlir::LLVM::LLVMVoidType>(ty);
-    };
-
-    if (isVoidTy(currentType)) {
-        mlir::emitError(loc) << "coerce: source type is void (invalid SSA value) (to " << targetType << ")";
-        return {};
-    }
-
-    if (isVoidTy(targetType)) {
-        return {};
-    }
-
-    auto emitFail = [&](mlir::Twine msg) -> mlir::Value {
-        mlir::emitError(loc) << "coerce: " << msg << " (from " << currentType << " to " << targetType << ")";
-        return {};
-    };
-
-    // Pointer -> Pointer (addrspace-safe)
-    if (llvm::isa<mlir::LLVM::LLVMPointerType>(currentType) &&
-        llvm::isa<mlir::LLVM::LLVMPointerType>(targetType)) {
-        auto srcPtrTy = llvm::cast<mlir::LLVM::LLVMPointerType>(currentType);
-        auto dstPtrTy = llvm::cast<mlir::LLVM::LLVMPointerType>(targetType);
-
-        if (srcPtrTy.getAddressSpace() != dstPtrTy.getAddressSpace()) {
-            return b.create<mlir::LLVM::AddrSpaceCastOp>(loc, dstPtrTy, val);
-        }
-        // LLVM 15+ uses opaque pointers, so if address spaces match, no cast is needed
-        return val;
-    }
-
-    // Pointer <-> Integer
-    if (llvm::isa<mlir::LLVM::LLVMPointerType>(currentType) && targetType.isInteger()) {
-        return b.create<mlir::LLVM::PtrToIntOp>(loc, targetType, val);
-    }
-    if (currentType.isInteger() && llvm::isa<mlir::LLVM::LLVMPointerType>(targetType)) {
-        return b.create<mlir::LLVM::IntToPtrOp>(loc, targetType, val);
-    }
-
-    // F32 <-> F64
-    if (currentType.isF32() && targetType.isF64())
-        return b.create<mlir::LLVM::FPExtOp>(loc, targetType, val);
-    if (currentType.isF64() && targetType.isF32())
-        return b.create<mlir::LLVM::FPTruncOp>(loc, targetType, val);
-
-    // Integer Expansion / Truncation
-    if (currentType.isInteger() && targetType.isInteger()) {
-        unsigned srcW = currentType.getIntOrFloatBitWidth();
-        unsigned dstW = targetType.getIntOrFloatBitWidth();
-
-        if (dstW > srcW) {
-            if (srcW == 1) return b.create<mlir::LLVM::ZExtOp>(loc, targetType, val);
-            return b.create<mlir::LLVM::SExtOp>(loc, targetType, val);
-        }
-        if (dstW < srcW) return b.create<mlir::LLVM::TruncOp>(loc, targetType, val);
-        return val;
-    }
-
-    // Integer <-> Float
-    if (llvm::isa<mlir::IntegerType>(currentType) && llvm::isa<mlir::FloatType>(targetType)) {
-        return b.create<mlir::LLVM::SIToFPOp>(loc, targetType, val);
-    }
-    if (llvm::isa<mlir::FloatType>(currentType) && llvm::isa<mlir::IntegerType>(targetType)) {
-        return b.create<mlir::LLVM::FPToSIOp>(loc, targetType, val);
-    }
-
-    // [CRITICAL] Safe call to getPrimitiveTypeSizeInBits
-    // Only call this if BOTH types are actually compatible with the LLVM Dialect.
-    auto isLLVMCompatible = [](mlir::Type t) {
-        return t.getDialect().getNamespace() == "llvm" || t.isSignlessIntOrFloat();
-    };
-
-    if (isLLVMCompatible(currentType) && isLLVMCompatible(targetType)) {
-        const unsigned srcBits = mlir::LLVM::getPrimitiveTypeSizeInBits(currentType);
-        const unsigned dstBits = mlir::LLVM::getPrimitiveTypeSizeInBits(targetType);
-        if (srcBits > 0 && srcBits == dstBits) {
-            return b.create<mlir::LLVM::BitcastOp>(loc, targetType, val);
-        }
-    }
-
-    return emitFail("no valid implicit coercion");
-}
-
-
-// =============================================================================
-// Copy Semantics Check (RAII Helper)
-// Determines if a type is "Trivially Copyable" (Copy) or "Resource" (Move)
-// =============================================================================
-bool GenMIR::isCopyType(const arklang::Type &t) {
-    // 1. Primitives are Copy
-    if (t.isScalar() || t.isInteger() || t.isFloat()) return true;
-    
-    // 2. References (Slices) are Copy (View semantics)
-    if (t.kind == arklang::Type::Slice) return true;
-    
-    // 3. Pointers/Functions are Copy (just an address)
-    if (t.kind == arklang::Type::Func) return true;
-    
-    // 4. Tuples: Copy if all subtypes are Copy
-    if (t.kind == arklang::Type::Tuple) {
-        for (const auto &sub : t.subtypes) {
-            if (!isCopyType(sub)) return false;
-        }
-        return true;
-    }
-    
-    // 5. Default: Everything else is Move (Vec, String, Tensor, Schema)
-    return false;
-}
-
-
 
 GenMIR::GenMIR(mlir::ModuleOp m, mlir::OpBuilder &b, arklang::hud::Hud &hud_ref)
     : hud(hud_ref), module(m), builder(b) {
@@ -810,185 +125,6 @@ LogicalResult GenMIR::fail(SourceLoc loc, const llvm::Twine &msg) {
     return failure();
 }
 
-
-// =============================================================================
-// Schema Instantiation
-// =============================================================================
-
-const GenMIR::SchemaInfo *
-GenMIR::getOrInstantiateSchema(llvm::StringRef userProvidedName,
-                               llvm::ArrayRef<arklang::Type> args) {
-    
-    // 1. Resolve AST
-    const SchemaDecl *decl = resolveSchemaAST(userProvidedName.str());
-    if (!decl) {
-        llvm::errs() << "[GenMIR] Schema '" << userProvidedName << "' not found.\n";
-        return nullptr;
-    }
-
-    // 2. Mangle Name
-    std::string canonicalBaseName = decl->name;
-    // Use our standardized mangler
-    std::string lookupKey = mangleGenericName(canonicalBaseName, args);
-
-    // 3. Check Registry
-    if (auto it = schemaRegistry.find(lookupKey); it != schemaRegistry.end())
-        return &it->second;
-
-    // 4. Verify Generics
-    llvm::StringMap<arklang::Type> subst;
-    if (!decl->genericParams.empty()) {
-        if (args.size() != decl->genericParams.size()) {
-            return nullptr;
-        }
-        for (size_t i = 0; i < decl->genericParams.size(); ++i)
-            subst[decl->genericParams[i]] = args[i];
-    }
-
-    // 5. Initialize Info
-    SchemaInfo info;
-    info.name = lookupKey;
-    info.isPacked = false;
-    info.isEnum = (decl->kind == SchemaDecl::Enum);
-
-    // 6. Instantiate Fields
-    if (decl->kind == SchemaDecl::Record) {
-        info.fieldTypes.reserve(decl->fields.size());
-        for (size_t i = 0; i < decl->fields.size(); ++i) {
-            const auto &f = decl->fields[i];
-            info.fieldIndices[f.name] = static_cast<int64_t>(i);
-            
-            // [FIX] Use substituteTypeParams
-            Type concrete = substituteTypeParams(f.type, subst);
-            info.fieldTypes.push_back(concrete);
-        }
-    }
-
-    // 7. Define LLVM Struct
-    // [FIX] Use llvmStructNameFor
-    const std::string llvmName = llvmStructNameFor(lookupKey);
-    mlir::LLVM::LLVMStructType llvmStruct =
-        mlir::LLVM::LLVMStructType::getIdentified(builder.getContext(), llvmName);
-
-    if (!llvmStruct.isInitialized()) {
-        llvm::SmallVector<mlir::Type, 8> bodyTypes;
-
-        if (decl->kind == SchemaDecl::Record) {
-             bodyTypes.reserve(info.fieldTypes.size());
-             for (const auto &ft : info.fieldTypes) bodyTypes.push_back(convertType(ft));
-        } else if (decl->kind == SchemaDecl::Enum) {
-            // Enum Layout: { Tag(i32), Payload([32 x i8]) }
-            // Note: In a real compiler, compute max(sizeof(variants))
-            bodyTypes.push_back(builder.getI32Type());
-            
-            auto byteType = builder.getI8Type();
-            auto payloadType = mlir::LLVM::LLVMArrayType::get(byteType, 32); 
-            bodyTypes.push_back(payloadType);
-        }
-
-        if (failed(llvmStruct.setBody(bodyTypes, info.isPacked))) {
-            return nullptr;
-        }
-    }
-
-    info.loweredType = llvmStruct;
-    schemaRegistry[lookupKey] = std::move(info);
-    return &schemaRegistry[lookupKey];
-}
-
-// =============================================================================
-// Type Conversion (AST -> LLVM Dialect / MemRef)
-// =============================================================================
-mlir::Type GenMIR::convertType(const arklang::Type &astType) {
-    mlir::MLIRContext *ctx = module.getContext();
-
-    // [CRITICAL CHECK] Handle "Alloc<T>" (Intrinsic Pointer)
-    if (astType.kind == arklang::Type::Generic && astType.schemaName == "Alloc") {
-        // Alloc inside a GPU kernel usually maps to a raw pointer or MemRef
-        // depending on usage, but for now we stick to LLVMPointer to support
-        // raw address manipulation unless it's strictly a tensor argument.
-        return mlir::LLVM::LLVMPointerType::get(ctx);
-    }
-
-    // [CRITICAL FIX] Domain-Aware Tensor Lowering
-    // If we are compiling a GPU Kernel, Tensors must be MemRefs to allow
-    // the BarePointer ABI to split them into (ptr, size).
-    // On the Host, they remain as Pointers/Structs.
-    if (isTensorType(astType)) {
-        if (currentFnDomain == Domain::GPU) {
-            // [GPU] Map to 1D Dynamic MemRef (f32 default for now)
-            // Ideally, extract element type from genericArgs[0]
-            mlir::Type elemTy = builder.getF32Type(); 
-            return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, elemTy);
-        } else {
-            // [HOST] Map to opaque pointer (or struct if you prefer descriptors on host)
-            return mlir::LLVM::LLVMPointerType::get(ctx);
-        }
-    }
-
-    switch (astType.kind) {
-        case arklang::Type::Void: return mlir::LLVM::LLVMStructType::getLiteral(ctx, {});
-        
-        case arklang::Type::Bool: return mlir::IntegerType::get(ctx, 1);
-        case arklang::Type::I8:   return mlir::IntegerType::get(ctx, 8);
-        case arklang::Type::I16:  return mlir::IntegerType::get(ctx, 16);
-        case arklang::Type::I32:  return mlir::IntegerType::get(ctx, 32);
-        case arklang::Type::I64:  return mlir::IntegerType::get(ctx, 64);
-        case arklang::Type::U8:   return mlir::IntegerType::get(ctx, 8);
-        case arklang::Type::U16:  return mlir::IntegerType::get(ctx, 16);
-        case arklang::Type::U32:  return mlir::IntegerType::get(ctx, 32);
-        case arklang::Type::U64:  return mlir::IntegerType::get(ctx, 64);
-        
-        case arklang::Type::F32:  return mlir::Float32Type::get(ctx);
-        case arklang::Type::F64:  return mlir::Float64Type::get(ctx);
-        
-        case arklang::Type::Str: {
-            auto ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
-            auto i64Ty = mlir::IntegerType::get(ctx, 64);
-            return mlir::LLVM::LLVMStructType::getLiteral(ctx, {ptrTy, i64Ty});
-        }
-
-        case arklang::Type::Func: 
-            return mlir::LLVM::LLVMPointerType::get(ctx);
-
-        case arklang::Type::Vec: {
-             auto ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
-             auto lenTy = mlir::IntegerType::get(ctx, 64);
-             return mlir::LLVM::LLVMStructType::getLiteral(ctx, {ptrTy, lenTy, lenTy});
-        }
-
-        case arklang::Type::Slice: {
-             auto ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
-             auto lenTy = mlir::IntegerType::get(ctx, 64);
-             return mlir::LLVM::LLVMStructType::getLiteral(ctx, {ptrTy, lenTy});
-        }
-        
-        case arklang::Type::Tuple: {
-             llvm::SmallVector<mlir::Type, 4> elements;
-             for (const auto &sub : astType.subtypes) {
-                 elements.push_back(convertType(sub));
-             }
-             return mlir::LLVM::LLVMStructType::getLiteral(ctx, elements);
-        }
-
-        case arklang::Type::Schema:
-        case arklang::Type::Generic: {
-             const auto *info = getOrInstantiateSchema(astType.schemaName, astType.genericArgs);
-             if (info) return info->loweredType;
-             
-             llvm::errs() << "[ERROR] convertType: Failed to resolve schema '" << astType.schemaName << "'\n";
-             return mlir::LLVM::LLVMPointerType::get(ctx);
-        }
-
-        default: break;
-    }
-
-    llvm::errs() << "[WARNING] convertType: Unknown type kind " << (int)astType.kind 
-                 << ". Returning Unit/Void.\n";
-    return mlir::LLVM::LLVMStructType::getLiteral(ctx, {});
-}
-
-
 // =============================================================================
 // Modules
 // =============================================================================
@@ -1004,114 +140,71 @@ std::string GenMIR::mangleFunction(const std::string& name, const Module* mod) {
     return prefix + "_" + name;      // Imported: "main" -> "generics_main"
 }
 
-// [UPDATED] Registration now handles Name Mangling
-void GenMIR::registerModule(const Module &astMod, bool isRoot) {
-    // 1. Determine & Store Prefix
-    // Root module gets empty prefix. Imports get their ID (filename stem).
+// =============================================================================
+// Module Registration
+// =============================================================================
+// Responsibilities:
+// - assign/stash the module prefix used for symbol mangling
+// - register functions into the global function registry
+// - register schemas into the global schema registry
+// =============================================================================
+void GenMIR::registerModule(const Module& astMod, bool isRoot) {
+    // 1. Determine and store prefix.
+    // Root module gets empty prefix. Imports get their module id.
     std::string prefix = isRoot ? "" : astMod.id;
     modulePrefixes[&astMod] = prefix;
 
-    // 2. Index Functions
+    // 2. Index functions.
     for (const auto& fn : astMod.functions) {
-        // Calculate mangled name immediately for the registry
         std::string mangledName = prefix.empty() ? fn->name : prefix + "_" + fn->name;
 
         if (globalFunctionMap.count(mangledName)) {
-             // This warning is useful for debugging collisions within the same namespace
-             llvm::errs() << "[ArkC] Warning: Overwriting symbol '" << mangledName << "'\n";
+            llvm::errs() << "[ArkC] Warning: Overwriting symbol '" << mangledName << "'\n";
         }
 
         globalFunctionMap[mangledName] = fn.get();
-        
-        // Store param names using the mangled key so calls can find them
+
         std::vector<std::string> params;
-        for(auto &p : fn->args) params.push_back(p.first);
+        for (auto& param : fn->args) {
+            params.push_back(param.first);
+        }
         funcParamNames[mangledName] = std::move(params);
     }
 
-    // 3. Index Schemas
-    // We currently keep schemas global. If you need namespacing here (e.g. mod.Struct),
-    // you would mangle these similarly. For now, we assume schema names are unique enough.
-    for (const auto& s : astMod.schemas) {
-        globalSchemaMap[s->name] = s.get();
-    }
+    // 3. Index schemas.
+    registerModuleSchemas(astMod);
 }
 
 // =============================================================================
-// 1. Compile Module (Creates Globals for Singletons)
+// 1. Compile Module
 // =============================================================================
-mlir::LogicalResult GenMIR::compileModule(const Module &astMod, bool isRoot) {
+// Responsibilities:
+// - establish current AST/module context
+// - pre-materialize singleton schemas as globals
+// - lower all functions in the module
+// =============================================================================
+mlir::LogicalResult GenMIR::compileModule(const Module& astMod, bool isRoot) {
     this->astModule = &astMod;
     this->currentContextPrefix = isRoot ? "" : astMod.id;
 
-    // A. Pre-pass: Lower Schemas & Create Singletons
+    // A. Pre-pass: lower singleton schemas into internal LLVM globals.
     for (const auto& decl : astMod.schemas) {
-        if (decl->isSingleton) {
-            if (!decl->genericParams.empty()) return fail(decl->loc, "Singleton schema cannot be generic");
-            if (decl->kind == SchemaDecl::Enum) return fail(decl->loc, "Singleton enums not supported yet");
-            
-            // 1. Instantiate Layout
-            const SchemaInfo* info = getOrInstantiateSchema(decl->name, {});
-            if (!info) return failure();
+        if (!decl->isSingleton) {
+            continue;
+        }
 
-            mlir::Type structTy = info->loweredType;
-            auto llvmStruct = mlir::cast<mlir::LLVM::LLVMStructType>(structTy);
-            std::string globalName = mangleFunction(decl->name, &astMod);
-            
-            mlir::OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPointToStart(module.getBody());
-
-            // 2. Create Global Variable
-            auto globalOp = builder.create<mlir::LLVM::GlobalOp>(
-                toLoc(decl->loc),
-                structTy,
-                /*isConstant=*/false, 
-                mlir::LLVM::Linkage::Internal,
-                globalName,
-                mlir::Attribute() 
-            );
-            globalSingletons[decl->name] = globalOp;
-
-            // 3. Generate Initializer Region
-            //    We use the same lowering logic as 'let' statements!
-            mlir::Region &region = globalOp.getInitializerRegion();
-            mlir::Block *block = builder.createBlock(&region);
-            
-            // Start with Zero-initialized Struct
-            mlir::Value currentStruct = builder.create<mlir::LLVM::ZeroOp>(toLoc(decl->loc), structTy);
-
-            for (size_t i = 0; i < decl->fields.size(); ++i) {
-                const auto& f = decl->fields[i];
-                mlir::Type fieldTy = llvmStruct.getBody()[i]; // Destination LLVM Type
-                mlir::Location fLoc = toLoc(decl->loc);
-
-                if (f.defaultValue) {
-                    // [UNIFIED] Delegate to standard expression lowering
-                    auto valRes = lowerExpr(*f.defaultValue);
-                    if (failed(valRes)) return failure();
-
-                    mlir::Value val = valRes->val;
-
-                    // [UNIFIED] Use standard coercion (Handles 1.5 -> f64, i32 -> i64, etc.)
-                    // This generates the necessary Cast/Ext instructions automatically.
-                    // The MLIR->LLVM translation will convert these to ConstantExprs where possible.
-                    val = coerce(builder, fLoc, val, fieldTy);
-
-                    // Insert into struct
-                    currentStruct = builder.create<mlir::LLVM::InsertValueOp>(
-                        fLoc, currentStruct, val, llvm::ArrayRef<int64_t>{(int64_t)i}
-                    );
-                }
-            }
-
-            builder.create<mlir::LLVM::ReturnOp>(toLoc(decl->loc), currentStruct);
+        if (failed(materializeSingletonSchema(astMod, *decl))) {
+            return failure();
         }
     }
 
-    // B. Compile Functions
+    // B. Compile functions.
     for (const auto& fn : astMod.functions) {
-        if (failed(lowerFunction(*fn))) return failure();
+        if (failed(lowerFunction(*fn))) {
+            return failure();
+        }
     }
+
     return success();
 }
 
@@ -1433,204 +526,8 @@ mlir::LogicalResult GenMIR::lowerCpuKernel(const Function &fn) {
 }
 
 
-// =============================================================================
-// GPU Kernel Lowering (Host Stub Generation)
-// =============================================================================
-mlir::LogicalResult GenMIR::lowerGpuKernel(const Function &fn) {
-    if (mlir::failed(emitGpuDeviceKernel(fn)))
-        return mlir::failure();
-    if (mlir::failed(emitGpuHostStub(fn)))
-        return mlir::failure();
-    return mlir::success();
-}
 
 
-// =============================================================================
-// Expression Handlers
-// =============================================================================
-
-mlir::FailureOr<RValue> GenMIR::lowerSchemaInit(const SchemaExpr &expr) {
-    mlir::Location loc = toLoc(expr.loc);
-
-    // 1. Resolve schema info and cache LLVM type
-    const auto *info = getOrInstantiateSchema(expr.name, expr.genericArgs);
-    if (!info) return fail(expr.loc, "Unknown schema: " + expr.name);
-
-    mlir::Type structTy = info->loweredType;
-    if (!structTy) return fail(expr.loc, "Internal error: Schema type was not lowered");
-
-    // 2. Create uninitialized SSA struct value
-    mlir::Value structVal = builder.create<mlir::LLVM::UndefOp>(loc, structTy);
-
-    // 3. Populate fields
-    for (const auto &fieldInit : expr.fields) {
-        auto it = info->fieldIndices.find(fieldInit.name);
-        if (it == info->fieldIndices.end()) {
-            return fail(expr.loc, "Field '" + fieldInit.name + "' not found in schema");
-        }
-        int64_t fieldIdx = it->second;
-
-        // 4. Lower field expression to RValue (consumes source)
-        auto valRes = lowerExpr(*fieldInit.value);
-        if (failed(valRes)) return failure();
-
-        // 5. Coerce value to exact struct field type
-        auto llvmStruct = mlir::cast<mlir::LLVM::LLVMStructType>(structTy);
-        mlir::Type fieldTy = llvmStruct.getBody()[fieldIdx];
-        mlir::Value coerced = coerce(builder, loc, valRes->val, fieldTy);
-
-        // 6. Insert value into SSA struct
-        structVal = builder.create<mlir::LLVM::InsertValueOp>(
-            loc, structVal, coerced, builder.getDenseI64ArrayAttr({fieldIdx}));
-    }
-
-    // 7. Return constructed struct as alive RValue
-    return RValue{structVal, unitAlive(builder, loc).state};
-}
-
-
-// =============================================================================
-// Variant Constructor (Enum Instantiation)
-// Lowers: Option.Some(10) -> { tag=1, payload={10} }
-// =============================================================================
-mlir::FailureOr<RValue> GenMIR::lowerVariantConstructor(
-    const MemberCallNode &expr,
-    const SchemaDecl *schemaDecl,
-    int tag,
-    const std::vector<Type> &payloadTypes) {
-
-    mlir::Location loc = toLoc(expr.loc);
-    mlir::Type indexTy = builder.getI64Type(); // Standardize on i64 for GEP indices
-
-    // 1. Instantiate Schema & Validate Layout
-    const SchemaInfo *schemaInfo = getOrInstantiateSchema(schemaDecl->name, {});
-    if (!schemaInfo) return fail(expr.loc, "Variant schema instantiation failed");
-
-    mlir::Type variantTy = schemaInfo->loweredType;
-    auto variantSt = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(variantTy);
-    
-    // Invariant: { TagType, [N x i8] }
-    if (!variantSt || variantSt.getBody().size() < 2)
-        return fail(expr.loc, "Variant must lower to {tag, payload, ...} struct");
-
-    mlir::Type tagFieldTy = variantSt.getBody()[0];
-    auto payloadArr = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(variantSt.getBody()[1]);
-    
-    if (!payloadArr || payloadArr.getElementType() != builder.getI8Type())
-        return fail(expr.loc, "Variant payload field must be [N x i8]");
-
-    const uint64_t payloadBytes = payloadArr.getNumElements();
-
-    // Constant Helpers
-    auto cIndex = [&](uint64_t v) {
-        return builder.create<mlir::LLVM::ConstantOp>(loc, indexTy, builder.getIntegerAttr(indexTy, v));
-    };
-    auto cI32 = [&](int32_t v) {
-        return builder.create<mlir::LLVM::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(v));
-    };
-    auto cI8 = [&](int8_t v) {
-        return builder.create<mlir::LLVM::ConstantOp>(loc, builder.getI8Type(), builder.getIntegerAttr(builder.getI8Type(), v));
-    };
-
-    // 2. Allocate Temp Slot for the Final Variant
-    mlir::Value variantSlot = mir->createSlot(loc, variantTy);
-    auto slotPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-
-    // 3. Zero-Initialize Payload
-    {
-        mlir::Value payloadBasePtr = builder.create<mlir::LLVM::GEPOp>(
-            loc,
-            slotPtrTy,
-            variantTy,
-            variantSlot,
-            mlir::ValueRange{cIndex(0), cIndex(1)}
-        ).getResult();
-
-        mlir::Value lenVal = cIndex(payloadBytes);
-        mlir::Value zeroByte = cI8(0);
-        
-        builder.create<mlir::LLVM::MemsetOp>(
-            loc, payloadBasePtr, zeroByte, lenVal, /*isVolatile=*/false);
-    }
-
-    // 4. Store Tag (Field 0)
-    {
-        mlir::Value tagPtr = builder.create<mlir::LLVM::GEPOp>(
-            loc, 
-            slotPtrTy,
-            variantTy, 
-            variantSlot,
-            mlir::ValueRange{cIndex(0), cIndex(0)}
-        ).getResult();
-
-        // Coerce tag literal to actual struct field type (usually i32)
-        mlir::Value tagVal = coerce(builder, loc, cI32(tag), tagFieldTy);
-        builder.create<mlir::LLVM::StoreOp>(loc, tagVal, tagPtr);
-    }
-
-    // 5. Construct Payload (Case-Specific)
-    if (!payloadTypes.empty()) {
-        if (expr.args.size() != payloadTypes.size())
-            return fail(expr.loc, "Variant argument count mismatch");
-
-        // A. Define Layout { T1, T2... }
-        llvm::SmallVector<mlir::Type, 8> caseFieldTys;
-        caseFieldTys.reserve(payloadTypes.size());
-        for (const auto &t : payloadTypes) caseFieldTys.push_back(convertType(t));
-
-        mlir::Type caseTy = mlir::LLVM::LLVMStructType::getLiteral(builder.getContext(), caseFieldTys);
-
-        // B. Size & Bounds Check
-        mlir::DataLayout dl(module);
-        const uint64_t caseBits = dl.getTypeSizeInBits(caseTy);
-        if (caseBits == 0) return fail(expr.loc, "Cannot compute variant case size");
-        const uint64_t caseBytes = (caseBits + 7) / 8;
-
-        if (caseBytes > payloadBytes) {
-            return fail(expr.loc, "Variant payload overflow");
-        }
-
-        // C. Aligned Construction in Temp Slot
-        mlir::Value caseSlot = mir->createSlot(loc, caseTy);
-
-        for (size_t i = 0; i < expr.args.size(); ++i) {
-            auto argRvOr = lowerExpr(*expr.args[i].value);
-            if (failed(argRvOr)) return failure();
-
-            mlir::Value fieldPtr = builder.create<mlir::LLVM::GEPOp>(
-                loc,
-                slotPtrTy,
-                caseTy,
-                caseSlot,
-                mlir::ValueRange{cIndex(0), cIndex(static_cast<int64_t>(i))}
-            ).getResult();
-
-            mlir::Value stored = coerce(builder, loc, argRvOr->val, caseFieldTys[i]);
-            builder.create<mlir::LLVM::StoreOp>(loc, stored, fieldPtr);
-        }
-
-        // D. Memcpy Case -> Variant Payload
-        mlir::Value payloadBasePtr = builder.create<mlir::LLVM::GEPOp>(
-            loc,
-            slotPtrTy,
-            variantTy,
-            variantSlot,
-            mlir::ValueRange{cIndex(0), cIndex(1)}
-        ).getResult();
-
-        builder.create<mlir::LLVM::MemcpyOp>(
-            loc,
-            payloadBasePtr, // Dest (Generic Array)
-            caseSlot,       // Src  (Typed Struct)
-            cIndex(static_cast<int64_t>(caseBytes)),
-            /*isVolatile=*/false
-        );
-    }
-
-    // 6. Return RValue (Value + Alive State)
-    mlir::Value result = builder.create<mlir::LLVM::LoadOp>(loc, variantTy, variantSlot);
-    return RValue{result, unitAlive(builder, loc).state};
-}
 
 
 // =============================================================================
@@ -1962,64 +859,49 @@ mlir::FailureOr<mlir::Value> GenMIR::lowerMemberPlace(const MemberExpr &expr) {
 
 // =============================================================================
 // R-Value Member Access (Unified Read)
-// Handles: Static Enums, Properties (.len), Fields (p.x), Reflection (.name)
-// Returns: RValue (Value + State)
+// Handles:
+// - builtin namespace properties
+// - static enum constructors
+// - builtin container/tuple properties
+// - schema field access / enum reflection
+// Returns:
+// - RValue (value + state)
 // =============================================================================
-mlir::FailureOr<RValue> GenMIR::lowerMemberAccess(const MemberExpr &expr) {
+mlir::FailureOr<RValue> GenMIR::lowerMemberAccess(const MemberExpr& expr) {
     mlir::Location loc = toLoc(expr.loc);
 
     // -------------------------------------------------------------------------
     // 0. Builtin Namespace Properties (SYS.args, FS.xxx)
     // -------------------------------------------------------------------------
     std::string baseName;
-    if (auto *objSym = dynamic_cast<const SymbolExpr*>(expr.object.get())) {
+    if (auto* objSym = dynamic_cast<const SymbolExpr*>(expr.object.get())) {
         baseName = objSym->name;
-    } else if (auto *objMem = dynamic_cast<const MemberExpr*>(expr.object.get())) {
-        if (auto *baseSym = dynamic_cast<const SymbolExpr*>(objMem->object.get())) {
+    } else if (auto* objMem = dynamic_cast<const MemberExpr*>(expr.object.get())) {
+        if (auto* baseSym = dynamic_cast<const SymbolExpr*>(objMem->object.get())) {
             baseName = baseSym->name + "." + objMem->member;
         }
     }
 
     if (!baseName.empty() && isBuiltinNamespace(baseName)) {
-        return lowerBuiltin(loc, baseName, expr.member, {}); // Pass empty args for properties
+        return lowerBuiltin(loc, baseName, expr.member, {});
     }
 
     // -------------------------------------------------------------------------
     // 1. Static Enum Access (e.g. Color.Red)
     // -------------------------------------------------------------------------
-    // If the object is a Symbol referring to an Enum Type (not a variable),
-    // we treat this as a Constructor Call (Variant Instantiation).
-    if (auto bName = resolveStaticEnumBase(*expr.object); !bName.empty()) {
-        const SchemaDecl *decl = resolveSchemaAST(bName);
-        if (decl && decl->kind == SchemaDecl::Enum) {
-            int tag = -1;
-            for (size_t i = 0; i < decl->variants.size(); ++i) {
-                if (decl->variants[i].name == expr.member) {
-                    tag = static_cast<int>(i);
-                    break;
-                }
-            }
-            if (tag >= 0) {
-                // We must create a synthetic MemberCallNode to invoke the constructor logic.
-                auto dummyBase = std::make_unique<SymbolExpr>(expr.loc, bName);
-                std::vector<CallArg> emptyArgs;
-
-                MemberCallNode call(expr.loc, std::move(dummyBase), expr.member, std::move(emptyArgs));
-
-                // Lower as a Unit Variant (e.g. Red has no payload)
-                return lowerVariantConstructor(call, decl, tag, {});
-            }
-        }
+    if (auto enumRes = lowerStaticEnumAccess(loc, expr); succeeded(enumRes)) {
+        return enumRes;
     }
 
     // -------------------------------------------------------------------------
-    // 2. Lower Base Object (RValue Read)
+    // 2. Lower Base Object
     // -------------------------------------------------------------------------
-    // If it's not a static enum, it must be an expression evaluating to an object.
     auto baseRvOr = lowerExpr(*expr.object);
-    if (failed(baseRvOr)) return failure();
-    RValue base = *baseRvOr;
+    if (failed(baseRvOr)) {
+        return failure();
+    }
 
+    RValue base = *baseRvOr;
     arklang::Type baseTy = getExprType(*expr.object);
 
     // -------------------------------------------------------------------------
@@ -2033,91 +915,67 @@ mlir::FailureOr<RValue> GenMIR::lowerMemberAccess(const MemberExpr &expr) {
     // -------------------------------------------------------------------------
     // 4. Builtin Properties (.len / .cap / .ok / .value)
     // -------------------------------------------------------------------------
-    if (baseTy.kind == arklang::Type::Vec || baseTy.kind == arklang::Type::Slice || baseTy.kind == arklang::Type::Str) {
+    if (baseTy.kind == arklang::Type::Vec ||
+        baseTy.kind == arklang::Type::Slice ||
+        baseTy.kind == arklang::Type::Str) {
         int field = -1;
 
-        if (expr.member == "len") field = 1;
-        else if (expr.member == "cap" && baseTy.kind == arklang::Type::Vec) field = 2;
+        if (expr.member == "len") {
+            field = 1;
+        } else if (expr.member == "cap" && baseTy.kind == arklang::Type::Vec) {
+            field = 2;
+        }
 
         if (field != -1) {
             if (llvm::isa<mlir::LLVM::LLVMPointerType>(base.val.getType())) {
                 mlir::Type structTy = convertType(baseTy);
                 base.val = builder.create<mlir::LLVM::LoadOp>(loc, structTy, base.val);
-            }
-            auto ex = builder.create<mlir::LLVM::ExtractValueOp>(loc, base.val, builder.getDenseI64ArrayAttr({(int64_t)field}));
-            return RValue{ex.getResult(), base.state};
-        }
-    }
-
-    // [FIX 3] Enable tuple destructuring for Option structs (home.ok, home.value)
-    if (baseTy.kind == arklang::Type::Tuple) {
-        int field = -1;
-        if (expr.member == "value" || expr.member == "0") field = 0;
-        else if (expr.member == "ok" || expr.member == "1") field = 1;
-
-        if (field != -1) {
-            if (llvm::isa<mlir::LLVM::LLVMPointerType>(base.val.getType())) {
-                mlir::Type structTy = convertType(baseTy);
-                base.val = builder.create<mlir::LLVM::LoadOp>(loc, structTy, base.val);
-            }
-            auto ex = builder.create<mlir::LLVM::ExtractValueOp>(loc, base.val, builder.getDenseI64ArrayAttr({(int64_t)field}));
-            return RValue{ex.getResult(), base.state};
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // 5. Schema Access (Fields & Reflection)
-    // -------------------------------------------------------------------------
-    if (baseTy.kind == arklang::Type::Schema || baseTy.kind == arklang::Type::Generic) {
-        const SchemaInfo *info = getOrInstantiateSchema(baseTy.schemaName, baseTy.genericArgs);
-        if (!info) return fail(expr.loc, "Unknown schema type: " + baseTy.schemaName);
-
-        // A. Enum Reflection: .name
-        if (info->isEnum && expr.member == "name") {
-            if (llvm::isa<mlir::LLVM::LLVMPointerType>(base.val.getType())) {
-                base.val = builder.create<mlir::LLVM::LoadOp>(loc, info->loweredType, base.val);
-            }
-
-            auto tag = builder.create<mlir::LLVM::ExtractValueOp>(
-                loc, base.val, builder.getDenseI64ArrayAttr({0})).getResult();
-
-            const SchemaDecl *decl = resolveSchemaAST(baseTy.schemaName);
-            if (!decl) return fail(expr.loc, "Missing AST for enum: " + baseTy.schemaName);
-
-            auto resOr = lowerString(StringExpr(expr.loc, "?")); 
-            if (failed(resOr)) return failure();
-            mlir::Value acc = resOr->val;
-
-            for (int i = static_cast<int>(decl->variants.size()) - 1; i >= 0; --i) {
-                auto sOr = lowerString(StringExpr(expr.loc, decl->variants[i].name));
-                if (failed(sOr)) return failure();
-
-                mlir::Value idx = builder.create<mlir::LLVM::ConstantOp>(
-                    loc, tag.getType(), builder.getIntegerAttr(tag.getType(), i));
-
-                mlir::Value cond = builder.create<mlir::LLVM::ICmpOp>(
-                    loc, mlir::LLVM::ICmpPredicate::eq, tag, idx);
-
-                acc = builder.create<mlir::LLVM::SelectOp>(loc, cond, sOr->val, acc).getResult();
-            }
-            return RValue{acc, unitAlive(builder, loc).state};
-        }
-
-        // B. Struct/Variant Payload Field
-        auto it = info->fieldIndices.find(expr.member);
-        if (it != info->fieldIndices.end()) {
-            if (llvm::isa<mlir::LLVM::LLVMPointerType>(base.val.getType())) {
-                base.val = builder.create<mlir::LLVM::LoadOp>(loc, info->loweredType, base.val);
             }
 
             auto ex = builder.create<mlir::LLVM::ExtractValueOp>(
-                loc, base.val, builder.getDenseI64ArrayAttr({it->second}));
+                loc,
+                base.val,
+                builder.getDenseI64ArrayAttr({static_cast<int64_t>(field)})
+            );
             return RValue{ex.getResult(), base.state};
         }
     }
 
-    return fail(expr.loc, "Member '" + expr.member + "' not found on type " + astTypeToString(baseTy));
+    if (baseTy.kind == arklang::Type::Tuple) {
+        int field = -1;
+
+        if (expr.member == "value" || expr.member == "0") {
+            field = 0;
+        } else if (expr.member == "ok" || expr.member == "1") {
+            field = 1;
+        }
+
+        if (field != -1) {
+            if (llvm::isa<mlir::LLVM::LLVMPointerType>(base.val.getType())) {
+                mlir::Type structTy = convertType(baseTy);
+                base.val = builder.create<mlir::LLVM::LoadOp>(loc, structTy, base.val);
+            }
+
+            auto ex = builder.create<mlir::LLVM::ExtractValueOp>(
+                loc,
+                base.val,
+                builder.getDenseI64ArrayAttr({static_cast<int64_t>(field)})
+            );
+            return RValue{ex.getResult(), base.state};
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Schema Access (fields / enum reflection)
+    // -------------------------------------------------------------------------
+    if (auto schemaRes = lowerSchemaMemberAccess(loc, expr, base, baseTy); succeeded(schemaRes)) {
+        return schemaRes;
+    }
+
+    return fail(expr.loc,
+                "Member '" + expr.member + "' not found on type " + astTypeToString(baseTy));
 }
+
 
 // =============================================================================
 // Launch Lowering (Async Kernel Dispatch)
@@ -2520,405 +1378,6 @@ mlir::FailureOr<RValue> GenMIR::lowerAwait(const AwaitExpr &aw) {
 }
 
 
-
-// =============================================================================
-// Intrinsic Lowering Helpers
-// =============================================================================
-
-// FIX: Strict Value Enforcement.
-// We strictly require 'v' to be the lowered SSA value (Struct).
-// We DO NOT accept pointers (LValues).
-mlir::FailureOr<mlir::Value> GenMIR::forceStrValue(mlir::Location loc, mlir::Value v, arklang::Type astTy) {
-    if (astTy.kind != arklang::Type::Str) {
-        return emitError(loc, "Internal: forceStrValue on non-Str AST type");
-    }
-
-    mlir::Type strTy = convertType(astTy);
-
-    if (v.getType() != strTy) {
-        return emitError(loc, "Internal: String intrinsic expects value (Struct), got ") 
-               << v.getType() << ". Missing Load?";
-    }
-
-    return v;
-}
-
-RValue GenMIR::emitPanic(mlir::Location loc, mlir::Value msgStrVal) {
-    arklang::Type strAst{arklang::Type::Str};
-    mlir::Type strTy = convertType(strAst);
-    mlir::Type voidTy = mlir::LLVM::LLVMVoidType::get(builder.getContext());
-
-    auto panicFn = getOrDeclRuntimeFn(module, builder, loc, "ark_panic", voidTy, {strTy});
-    
-    // FIX: Pure Unit Derivation.
-    // Explicitly create the UndefOp here before the block is terminated.
-    // This avoids reliance on 'unitAlive' behavior and ensures structurally valid IR.
-    mlir::Value deadUnit = getUnitUndef(builder, loc);
-
-    // Emit the terminator sequence
-    builder.create<mlir::LLVM::CallOp>(loc, panicFn, mlir::ValueRange{msgStrVal});
-    builder.create<mlir::LLVM::UnreachableOp>(loc);
-    
-    return RValue{deadUnit, constBool(builder, loc, false)};
-}
-
-
-// =============================================================================
-// Intrinsic Lowering Main Dispatch
-// =============================================================================
-mlir::FailureOr<RValue> GenMIR::lowerIntrinsicCall(const CallExpr &call, llvm::StringRef name) {
-    mlir::Location loc = toLoc(call.loc);
-    auto ipTy = builder.getI64Type(); // Use concrete I64 for intptr
-    mlir::DataLayout dl(module);
-
-    // Helper: Declare external runtime functions (malloc, free, hash)
-    auto getOrDeclRuntimeFn = [&](std::string fname, mlir::Type retTy, llvm::ArrayRef<mlir::Type> args) {
-        if (auto fn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(fname)) return fn;
-        mlir::OpBuilder::InsertionGuard g(builder);
-        builder.setInsertionPointToStart(module.getBody());
-        auto fnTy = mlir::LLVM::LLVMFunctionType::get(retTy, args, false);
-        return builder.create<mlir::LLVM::LLVMFuncOp>(builder.getUnknownLoc(), fname, fnTy);
-    };
-
-    // -------------------------------------------------------------------------
-    // 2. sizeof<T>() -> i64
-    // -------------------------------------------------------------------------
-    if (name == "sizeof") {
-        if (call.explicitGenericArgs.empty()) return fail(call.loc, "'sizeof' requires type <T>");
-        mlir::Type t = convertType(call.explicitGenericArgs[0]);
-        uint64_t bytes = (dl.getTypeSizeInBits(t) + 7) / 8;
-        return RValue{
-            builder.create<mlir::LLVM::ConstantOp>(loc, ipTy, builder.getIntegerAttr(ipTy, bytes)), 
-            constBool(builder, loc, true)
-        };
-    }
-
-    // -------------------------------------------------------------------------
-    // 3. typeof<T>() -> String
-    // -------------------------------------------------------------------------
-    if (name == "typeof") {
-        if (call.explicitGenericArgs.empty()) return fail(call.loc, "'typeof' requires type <T>");
-        std::string typeName = astTypeToString(call.explicitGenericArgs[0]);
-        
-        StringExpr s(call.loc, typeName);
-        return lowerString(s);
-    }
-
-    // -------------------------------------------------------------------------
-    // 4. castof<T>(val) -> T
-    // -------------------------------------------------------------------------
-    if (name == "castof") {
-        if (call.args.size() != 1) return fail(call.loc, "'castof' expects 1 argument");
-        if (call.explicitGenericArgs.empty()) return fail(call.loc, "'castof' requires target type <T>");
-
-        auto argRv = lowerExpr(*call.args[0].value);
-        if (failed(argRv)) return failure();
-
-        arklang::Type srcAstTy = getExprType(*call.args[0].value);
-        arklang::Type dstAstTy = call.explicitGenericArgs[0];
-        
-        mlir::Value input = argRv->val;
-        mlir::Type inputTy = input.getType();
-        mlir::Type targetTy = convertType(dstAstTy);
-
-        // A. Ptr <-> Ptr
-        if (llvm::isa<mlir::LLVM::LLVMPointerType>(inputTy) && 
-            llvm::isa<mlir::LLVM::LLVMPointerType>(targetTy)) {
-            return RValue{builder.create<mlir::LLVM::BitcastOp>(loc, targetTy, input), argRv->state};
-        }
-        // B. Ptr <-> Int
-        if (llvm::isa<mlir::LLVM::LLVMPointerType>(inputTy) && llvm::isa<mlir::IntegerType>(targetTy)) {
-            return RValue{builder.create<mlir::LLVM::PtrToIntOp>(loc, targetTy, input), argRv->state};
-        }
-        if (llvm::isa<mlir::IntegerType>(inputTy) && llvm::isa<mlir::LLVM::LLVMPointerType>(targetTy)) {
-            return RValue{builder.create<mlir::LLVM::IntToPtrOp>(loc, targetTy, input), argRv->state};
-        }
-
-        // C. Int <-> Int
-        auto intIn = llvm::dyn_cast<mlir::IntegerType>(inputTy);
-        auto intOut = llvm::dyn_cast<mlir::IntegerType>(targetTy);
-        
-        if (intIn && intOut) {
-            unsigned inW = intIn.getWidth();
-            unsigned outW = intOut.getWidth();
-            
-            if (inW == outW) return RValue{input, argRv->state}; 
-            if (inW > outW)  return RValue{builder.create<mlir::LLVM::TruncOp>(loc, targetTy, input), argRv->state};
-            
-            if (srcAstTy.isSigned()) {
-                return RValue{builder.create<mlir::LLVM::SExtOp>(loc, targetTy, input), argRv->state};
-            } else {
-                return RValue{builder.create<mlir::LLVM::ZExtOp>(loc, targetTy, input), argRv->state};
-            }
-        }
-
-        // D. Float <-> Float
-        auto floatIn = llvm::dyn_cast<mlir::FloatType>(inputTy);
-        auto floatOut = llvm::dyn_cast<mlir::FloatType>(targetTy);
-        if (floatIn && floatOut) {
-            unsigned inW = floatIn.getWidth();
-            unsigned outW = floatOut.getWidth();
-            if (inW > outW) return RValue{builder.create<mlir::LLVM::FPTruncOp>(loc, targetTy, input), argRv->state};
-            return RValue{builder.create<mlir::LLVM::FPExtOp>(loc, targetTy, input), argRv->state};
-        }
-
-        // E. Int <-> Float
-        if (intIn && floatOut) {
-            if (srcAstTy.isSigned()) return RValue{builder.create<mlir::LLVM::SIToFPOp>(loc, targetTy, input), argRv->state};
-            return RValue{builder.create<mlir::LLVM::UIToFPOp>(loc, targetTy, input), argRv->state};
-        }
-        if (floatIn && intOut) {
-            if (dstAstTy.isSigned()) return RValue{builder.create<mlir::LLVM::FPToSIOp>(loc, targetTy, input), argRv->state};
-            return RValue{builder.create<mlir::LLVM::FPToUIOp>(loc, targetTy, input), argRv->state};
-        }
-
-        return fail(call.loc, "castof unsupported operand combination");
-    }
-
-    // -------------------------------------------------------------------------
-    // 5. free(ptr) -> Void
-    // -------------------------------------------------------------------------
-    if (name == "free") {
-        if (call.args.size() != 1) return fail(call.loc, "'free' expects 1 argument");
-        auto argRv = lowerExpr(*call.args[0].value);
-        if (failed(argRv)) return failure();
-
-        auto voidTy = mlir::LLVM::LLVMVoidType::get(builder.getContext());
-        auto voidPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-        auto freeFn = getOrDeclRuntimeFn("free", voidTy, {voidPtrTy});
-
-        mlir::Value ptr = castToExpectedPtr(builder, loc, argRv->val, voidPtrTy);
-        builder.create<mlir::LLVM::CallOp>(loc, freeFn, mlir::ValueRange{ptr});
-        
-        return RValue{getUnitUndef(builder, loc), constBool(builder, loc, true)};
-    }
-
-    // -------------------------------------------------------------------------
-    // 6. len(container) -> i64
-    // -------------------------------------------------------------------------
-    if (name == "len") {
-        if (call.args.size() != 1) return fail(call.loc, "'len' expects 1 argument");
-
-        arklang::Type astTy = getExprType(*call.args[0].value);
-        bool isContainer = (astTy.kind == arklang::Type::Vec || 
-                            astTy.kind == arklang::Type::Slice || 
-                            astTy.kind == arklang::Type::Str);
-
-        if (!isContainer) return fail(call.loc, "Type does not support 'len'");
-
-        auto argRv = lowerExpr(*call.args[0].value);
-        if (failed(argRv)) return failure();
-
-        mlir::Value v = argRv->val;
-        
-        if (llvm::isa<mlir::LLVM::LLVMPointerType>(v.getType())) {
-            return fail(call.loc, "Internal: 'len' intrinsic received pointer. Missing explicit load?");
-        }
-        
-        if (v.getType() != convertType(astTy)) {
-            return fail(call.loc, "Internal: 'len' called on incorrect struct type.");
-        }
-
-        if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(v.getType())) {
-            auto fields = st.getBody();
-            if (fields.size() < 2) return fail(call.loc, "Internal: Container struct layout too small");
-
-            if (auto lenField = llvm::dyn_cast<mlir::IntegerType>(fields[1])) {
-                if (lenField.getWidth() != ipTy.getWidth()) {
-                    return fail(call.loc, "Container ABI mismatch: len field bitwidth != pointer bitwidth");
-                }
-                
-                mlir::Value lenVal = builder.create<mlir::LLVM::ExtractValueOp>(loc, v, builder.getDenseI64ArrayAttr({1}));
-                return RValue{lenVal, constBool(builder, loc, true)};
-            }
-        }
-        return fail(call.loc, "Container layout mismatch (expected {ptr, size_t, ...})");
-    }
-
-    // -------------------------------------------------------------------------
-    // 7. addr(place) -> Ptr
-    // -------------------------------------------------------------------------
-    if (name == "addr") {
-        if (call.args.size() != 1) return fail(call.loc, "'addr' expects 1 argument");
-        
-        auto placeOr = lowerExprAsPlace(*call.args[0].value);
-        if (failed(placeOr)) return fail(call.loc, "'addr' requires an addressable place");
-
-        mlir::Value p = *placeOr;
-        auto voidPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-        
-        p = castToExpectedPtr(builder, loc, p, voidPtrTy);
-        
-        return RValue{p, constBool(builder, loc, true)};
-    }
-
-    // -------------------------------------------------------------------------
-    // 8. min(a, b) -> T
-    // -------------------------------------------------------------------------
-    if (name == "min") {
-        if (call.args.size() != 2) return fail(call.loc, "'min' expects 2 arguments");
-        
-        auto lhsRv = lowerExpr(*call.args[0].value);
-        auto rhsRv = lowerExpr(*call.args[1].value);
-        if (failed(lhsRv) || failed(rhsRv)) return failure();
-
-        mlir::Value lhs = lhsRv->val;
-        mlir::Value rhs = coerce(builder, loc, rhsRv->val, lhs.getType());
-
-        if (llvm::isa<mlir::FloatType>(lhs.getType())) {
-            mlir::Value res = builder.create<mlir::LLVM::MinNumOp>(loc, lhs, rhs);
-            return RValue{res, constBool(builder, loc, true)};
-        } 
-        
-        mlir::Value pred;
-        if (llvm::isa<mlir::IntegerType>(lhs.getType())) {
-            bool isSigned = getExprType(*call.args[0].value).isSigned();
-            auto predKind = isSigned ? mlir::LLVM::ICmpPredicate::slt : mlir::LLVM::ICmpPredicate::ult;
-            pred = builder.create<mlir::LLVM::ICmpOp>(loc, predKind, lhs, rhs);
-        } else {
-            return fail(call.loc, "'min' only supports integer/float types");
-        }
-        
-        mlir::Value res = builder.create<mlir::LLVM::SelectOp>(loc, pred, lhs, rhs);
-        return RValue{res, constBool(builder, loc, true)};
-    }
-
-    // -------------------------------------------------------------------------
-    // 9. panic(msg) -> NoReturn
-    // -------------------------------------------------------------------------
-    if (name == "panic") {
-        if (call.args.size() != 1) return fail(call.loc, "'panic' expects 1 argument");
-        
-        arklang::Type argTy = getExprType(*call.args[0].value);
-        auto msgRv = lowerExpr(*call.args[0].value);
-        if (failed(msgRv)) return failure();
-
-        auto msgOr = forceStrValue(loc, msgRv->val, argTy);
-        if (failed(msgOr)) return failure();
-
-        return emitPanic(loc, *msgOr);
-    }
-
-    // -------------------------------------------------------------------------
-    // 10. assert(cond, msg?) -> Void
-    // -------------------------------------------------------------------------
-    if (name == "assert") {
-        if (call.args.size() < 1 || call.args.size() > 2) 
-            return fail(call.loc, "'assert' expects 1 or 2 arguments");
-
-        arklang::Type condAstTy = getExprType(*call.args[0].value);
-        if (condAstTy.kind != arklang::Type::Bool) {
-            return fail(call.loc, "'assert' condition must be boolean");
-        }
-
-        auto condRv = lowerExpr(*call.args[0].value);
-        if (failed(condRv)) return failure();
-        
-        mlir::Value cond = condRv->val;
-        if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(cond.getType())) {
-             if (intTy.getWidth() != 1) return fail(call.loc, "Internal: assert bool lowering mismatch");
-        } else {
-             return fail(call.loc, "Internal: assert condition is not integer");
-        }
-
-        mlir::Block *curBlock = builder.getInsertionBlock();
-        if (!curBlock) return fail(call.loc, "assert outside of a block");
-
-        auto contBlockOr = splitBlockAt(builder, loc, curBlock);
-        if (failed(contBlockOr)) return failure();
-        
-        mlir::Block *contBlock = *contBlockOr;
-        mlir::Region *region = curBlock->getParent();
-        mlir::Block *failBlock = builder.createBlock(region, contBlock->getIterator());
-
-        builder.setInsertionPointToEnd(curBlock);
-        
-        if (curBlock->getTerminator()) {
-             return fail(call.loc, "Internal Error: terminator conflict in assert");
-        }
-        builder.create<mlir::LLVM::CondBrOp>(loc, cond, contBlock, failBlock);
-
-        // Fail Path
-        builder.setInsertionPointToStart(failBlock);
-        mlir::Value msg;
-        if (call.args.size() == 2) {
-            arklang::Type msgTy = getExprType(*call.args[1].value);
-            auto msgRv = lowerExpr(*call.args[1].value);
-            if (failed(msgRv)) return failure();
-            
-            auto msgOr = forceStrValue(loc, msgRv->val, msgTy);
-            if (failed(msgOr)) return failure();
-            msg = *msgOr;
-        } else {
-            StringExpr s(call.loc, "Assertion failed");
-            auto sRes = lowerString(s);
-            if (failed(sRes)) return failure();
-            msg = sRes->val;
-        }
-        emitPanic(loc, msg);
-
-        // Resume Path
-        builder.setInsertionPointToStart(contBlock);
-        return RValue{getUnitUndef(builder, loc), constBool(builder, loc, true)};
-    }
-
-    // -------------------------------------------------------------------------
-    // 11. Universal Hashes: hash(val), shash(val), stable_hash(val) -> i64
-    // -------------------------------------------------------------------------
-    if (name == "hash" || name == "shash" || name == "stable_hash") {
-        if (call.args.size() != 1) return fail(call.loc, "'" + std::string(name) + "' expects 1 argument");
-        
-        auto argRvOr = lowerExpr(*call.args[0].value);
-        if (failed(argRvOr)) return failure();
-        
-        mlir::Value val = argRvOr->val;
-        arklang::Type astTy = getExprType(*call.args[0].value);
-
-        mlir::Value ptr, lenBytes;
-        mlir::Type i64Ty = builder.getI64Type();
-        auto voidPtrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext());
-
-        // Strategy A: Containers (String, Slice, Vec)
-        if (astTy.kind == arklang::Type::Str || astTy.kind == arklang::Type::Slice || astTy.kind == arklang::Type::Vec) {
-            if (llvm::isa<mlir::LLVM::LLVMPointerType>(val.getType())) {
-                val = builder.create<mlir::LLVM::LoadOp>(loc, convertType(astTy), val);
-            }
-            ptr = builder.create<mlir::LLVM::ExtractValueOp>(loc, val, builder.getDenseI64ArrayAttr({0})).getResult();
-            mlir::Value lenElems = builder.create<mlir::LLVM::ExtractValueOp>(loc, val, builder.getDenseI64ArrayAttr({1})).getResult();
-            
-            mlir::Type elemTy = builder.getI8Type();
-            if (!astTy.genericArgs.empty()) elemTy = convertType(astTy.genericArgs[0]);
-            
-            uint64_t elemSize = (dl.getTypeSizeInBits(elemTy) + 7) / 8;
-            if (elemSize > 1) {
-                mlir::Value elemSzVal = builder.create<mlir::LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(elemSize));
-                lenBytes = builder.create<mlir::LLVM::MulOp>(loc, lenElems, elemSzVal).getResult();
-            } else {
-                lenBytes = lenElems;
-            }
-            
-            ptr = castToExpectedPtr(builder, loc, ptr, voidPtrTy);
-        } 
-        // Strategy B: Primitives & Inline Structs
-        else {
-            uint64_t bytes = (dl.getTypeSizeInBits(val.getType()) + 7) / 8;
-            lenBytes = builder.create<mlir::LLVM::ConstantOp>(loc, i64Ty, builder.getI64IntegerAttr(bytes));
-            
-            mlir::Value spilled = mir->spillTemp(loc, val.getType(), val);
-            ptr = castToExpectedPtr(builder, loc, spilled, voidPtrTy);
-        }
-
-        // Dynamically select the runtime FFI target
-        llvm::StringRef runtimeFnName = (name == "hash") ? "__ark_hash_bytes" : "__ark_stable_hash_bytes";
-        
-        auto hashFn = getOrDeclRuntimeFn(std::string(runtimeFnName), i64Ty, {voidPtrTy, i64Ty});
-        auto callOp = builder.create<mlir::LLVM::CallOp>(loc, hashFn, mlir::ValueRange{ptr, lenBytes});
-        
-        return RValue{callOp.getOperation()->getResult(0), unitAlive(builder, loc).state};
-    }
-
-    return fail(call.loc, "Unknown intrinsic: " + std::string(name));
-}
 
 
 // =============================================================================
@@ -5294,60 +3753,6 @@ mlir::LogicalResult GenMIR::lowerWhile(const WhileStmt &stmt) {
     }
 
     return success();
-}
-
-// =============================================================================
-// Container Length Extraction (Fixed for C-Style ABI: Ptr + Explicit Size)
-// =============================================================================
-mlir::FailureOr<mlir::Value> GenMIR::getContainerLen(mlir::Location loc, const Expr &expr) {
-    // 1. Direct Kernel Size Lookup (Check VarInfo for explicitly passed 'len')
-    if (auto *sym = dynamic_cast<const SymbolExpr*>(&expr)) {
-        if (mir->isDeclared(sym->name)) {
-            VarInfo *var = mir->lookup(sym->name);
-            // If this variable was registered with a specific length (e.g., Kernel Tensor args)
-            if (var->len) {
-                return var->len; 
-            }
-        }
-    }
-
-    // 2. Lower the expression for Host Structs
-    auto res = lowerExpr(expr);
-    if (mlir::failed(res)) return mlir::failure();
-    RValue rv = *res;
-    mlir::Type ty = rv.val.getType();
-
-    // 3. Host Struct Unpacking (Vec, Slice, or Host Tensor)
-    if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(ty)) {
-        llvm::ArrayRef<mlir::Type> body = st.getBody();
-        if (body.size() < 2) {
-             return fail(expr.loc, "Container struct is too small to contain length information");
-        }
-        
-        // Extract Field 1 (Length)
-        mlir::Value len = builder.create<mlir::LLVM::ExtractValueOp>(
-            loc, body[1], rv.val, llvm::ArrayRef<int64_t>{1});
-            
-        if (!llvm::isa<mlir::IntegerType>(len.getType())) {
-             return fail(expr.loc, "Container length field (field 1) is not an integer");
-        }
-        
-        // Ensure loop bounds are always i64
-        if (len.getType().getIntOrFloatBitWidth() != 64) {
-            auto castOp = builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), len);
-            len = castOp.getResult();
-        }
-        return len;
-    }
-
-    // 4. Fallback (Raw Pointers lacking VarInfo::len)
-    if (llvm::isa<mlir::LLVM::LLVMPointerType>(ty)) {
-        return fail(expr.loc, 
-            "Cannot infer length of raw pointer natively.\n"
-            "Tip: Use an explicit range loop instead: 'par i in 0..size' or pass length as an argument.");
-    }
-
-    return fail(expr.loc, "Type does not support implicit length inference (not a Struct, Vec, Slice, or sized Kernel Arg)");
 }
 
 // =============================================================================
