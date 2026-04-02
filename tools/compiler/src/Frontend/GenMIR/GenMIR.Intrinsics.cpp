@@ -245,10 +245,10 @@ mlir::FailureOr<mlir::Value> GenMIR::forceStrValue(mlir::Location loc,
 // container values.
 // =============================================================================
 mlir::FailureOr<mlir::Value> GenMIR::getContainerLen(mlir::Location loc, const Expr& expr) {
-    // 1. Kernel/runtime-sized variables
-    if (auto* sym = dynamic_cast<const SymbolExpr*>(&expr)) {
-        if (mir->isDeclared(sym->name)) {
-            VarInfo* var = mir->lookup(sym->name);
+    if (expr.kind == ExprKind::Symbol) {
+        const auto& sym = static_cast<const SymbolExpr&>(expr);
+        if (mir->isDeclared(sym.name)) {
+            VarInfo* var = mir->lookup(sym.name);
             if (var->len) {
                 mlir::Value len = var->len;
                 if (len.getType() != builder.getI64Type()) {
@@ -259,7 +259,6 @@ mlir::FailureOr<mlir::Value> GenMIR::getContainerLen(mlir::Location loc, const E
         }
     }
 
-    // 2. Lower expression
     auto res = lowerExpr(expr);
     if (mlir::failed(res)) return mlir::failure();
 
@@ -267,7 +266,6 @@ mlir::FailureOr<mlir::Value> GenMIR::getContainerLen(mlir::Location loc, const E
     mlir::Value val = rv.val;
     arklang::Type astTy = getExprType(expr);
 
-    // 3. If lowered as pointer-to-container on host, load it first
     if (llvm::isa<mlir::LLVM::LLVMPointerType>(val.getType())) {
         mlir::Type loadedTy = convertType(astTy);
         if (llvm::isa<mlir::LLVM::LLVMStructType>(loadedTy)) {
@@ -280,7 +278,6 @@ mlir::FailureOr<mlir::Value> GenMIR::getContainerLen(mlir::Location loc, const E
         }
     }
 
-    // 4. Struct unpacking
     auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(val.getType());
     if (!st) {
         mlir::emitError(loc)

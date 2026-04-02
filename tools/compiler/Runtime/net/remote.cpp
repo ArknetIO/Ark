@@ -157,7 +157,9 @@ class StreamReader final {
         while (available() < want) {
             ArkBytes chunk{};
             ArkIoError err{};
-            const std::int64_t req = static_cast<std::int64_t>(want - available() > RECV_CHUNK ? RECV_CHUNK : (want - available()));
+            const std::int64_t req = static_cast<std::int64_t>(
+                want - available() > RECV_CHUNK ? RECV_CHUNK : (want - available())
+            );
 
             const ArkStatus st = __ark_net_recv(sockfd, req, &chunk, &err);
             if (st != 0) {
@@ -173,13 +175,7 @@ class StreamReader final {
             const std::size_t old_size = buf.size();
             const std::size_t add = static_cast<std::size_t>(chunk.len);
 
-            try {
-                buf.resize(old_size + add);
-            } catch (...) {
-                free_ark_bytes(&chunk);
-                return false;
-            }
-
+            buf.resize(old_size + add);
             std::memcpy(buf.data() + old_size, chunk.ptr, add);
             free_ark_bytes(&chunk);
         }
@@ -209,6 +205,7 @@ public:
         return true;
     }
 
+
     bool read_payload(int32_t sockfd, std::uint32_t len, std::vector<std::uint8_t>& out) {
         out.clear();
 
@@ -222,12 +219,7 @@ public:
             return false;
         }
 
-        try {
-            out.resize(len);
-        } catch (...) {
-            return false;
-        }
-
+        out.resize(len);
         std::memcpy(out.data(), buf.data() + rd, static_cast<std::size_t>(len));
         rd += static_cast<std::size_t>(len);
         compact_if_needed();

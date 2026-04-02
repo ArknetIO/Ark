@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace ark::compiler::pipeline {
@@ -32,16 +33,36 @@ static void removeDirTree(llvm::StringRef path) {
     if (path.empty()) {
         return;
     }
-    (void)llvm::sys::fs::remove_directories(path, /*IgnoreErrors=*/true);
+    (void)llvm::sys::fs::remove_directories(path, true);
 }
 
 static bool fileExists(llvm::StringRef path) {
     return !path.empty() && llvm::sys::fs::exists(path);
 }
 
+static bool dirExists(llvm::StringRef path) {
+    return !path.empty() && llvm::sys::fs::is_directory(path);
+}
+
 static std::string joinPath(llvm::StringRef a, llvm::StringRef b) {
     llvm::SmallString<256> p(a);
     llvm::sys::path::append(p, b);
+    return std::string(p.str());
+}
+
+static std::string canonicalizePath(llvm::StringRef in) {
+    if (in.empty()) {
+        return {};
+    }
+
+    llvm::SmallString<256> p(in);
+    std::error_code ec = llvm::sys::fs::make_absolute(p);
+    if (ec) {
+        llvm::sys::path::remove_dots(p, true);
+        return std::string(p.str());
+    }
+
+    llvm::sys::path::remove_dots(p, true);
     return std::string(p.str());
 }
 
@@ -71,34 +92,39 @@ static bool endsWithAnyCppLike(const std::vector<std::string>& files) {
     return false;
 }
 
-// ---------------------------------------------
-// Toolchain helpers
-// ---------------------------------------------
-static bool looksLikeClangDriver(llvm::StringRef exe) {
-    const llvm::StringRef stem = llvm::sys::path::stem(exe);
-    return lowerCopy(std::string(stem)).find("clang") != std::string::npos;
-}
-
-static bool looksLikeClangCl(llvm::StringRef exe) {
-    const std::string stem = lowerCopy(std::string(llvm::sys::path::stem(exe)));
-    return stem == "clang-cl";
-}
-
-static std::string escapeForAsm(const std::string& path) {
-    std::string out;
-    out.reserve(path.size());
-
-    for (char c : path) {
-        if (c == '\\') {
-            out += "\\\\";
-        } else if (c == '"') {
-            out += "\\\"";
-        } else {
-            out.push_back(c);
-        }
+static std::string parentDirOf(llvm::StringRef path) {
+    if (path.empty()) {
+        return {};
     }
 
-    return out;
+    llvm::SmallString<256> p(path);
+    if (!llvm::sys::fs::is_directory(p)) {
+        llvm::sys::path::remove_filename(p);
+    }
+    return std::string(p.str());
+}
+
+static std::string grandParentDirOf(llvm::StringRef path) {
+    const std::string parent = parentDirOf(path);
+    if (parent.empty()) {
+        return {};
+    }
+    return parentDirOf(parent);
+}
+
+static void pushUnique(std::vector<std::string>& out, llvm::StringRef value) {
+    if (value.empty()) {
+        return;
+    }
+
+    const std::string s = canonicalizePath(value);
+    if (s.empty()) {
+        return;
+    }
+
+    if (std::find(out.begin(), out.end(), s) == out.end()) {
+        out.push_back(s);
+    }
 }
 
 static std::vector<std::string> executableCandidates(const std::string& name) {
@@ -118,7 +144,71 @@ static std::string findProgramByNamePortable(const std::string& name) {
             return *found;
         }
     }
-    return "";
+    return {};
+}
+
+static std::string findFileInDir(llvm::StringRef dir, const std::string& name) {
+    if (dir.empty()) {
+        return {};
+    }
+
+    const std::string p = joinPath(dir, name);
+    return fileExists(p) ? canonicalizePath(p) : std::string();
+}
+
+static bool copyFileReplace(llvm::StringRef from, llvm::StringRef to) {
+    if (!fileExists(from)) {
+        return false;
+    }
+
+    const std::string dstParent = parentDirOf(to);
+    if (!dstParent.empty()) {
+        (void)llvm::sys::fs::create_directories(dstParent);
+    }
+
+    (void)llvm::sys::fs::remove(to);
+    return !llvm::sys::fs::copy_file(from, to);
+}
+
+// ---------------------------------------------
+// Toolchain helpers
+// ---------------------------------------------
+static bool looksLikeClangDriver(llvm::StringRef exe) {
+    const llvm::StringRef stem = llvm::sys::path::stem(exe);
+    return lowerCopy(std::string(stem)).find("clang") != std::string::npos;
+}
+
+static bool looksLikeClangCl(llvm::StringRef exe) {
+    const std::string stem = lowerCopy(std::string(llvm::sys::path::stem(exe)));
+    return stem == "clang-cl";
+}
+
+static bool pathLooksLikeVcpkgBundledLlvm(llvm::StringRef path) {
+    const std::string s = lowerCopy(std::string(path));
+#if defined(_WIN32)
+    return s.find("\\vcpkg\\installed\\") != std::string::npos &&
+           s.find("\\tools\\llvm\\") != std::string::npos;
+#else
+    return s.find("/vcpkg/installed/") != std::string::npos &&
+           s.find("/tools/llvm/") != std::string::npos;
+#endif
+}
+
+static std::string escapeForAsm(const std::string& path) {
+    std::string out;
+    out.reserve(path.size());
+
+    for (char c : path) {
+        if (c == '\\') {
+            out += "\\\\";
+        } else if (c == '"') {
+            out += "\\\"";
+        } else {
+            out.push_back(c);
+        }
+    }
+
+    return out;
 }
 
 static bool isSourceOnlyFlag(llvm::StringRef arg) {
@@ -182,31 +272,6 @@ static std::vector<std::string> filterIrLinkFlags(const std::vector<std::string>
     return out;
 }
 
-// ---------------------------------------------
-// Runtime source helpers
-// ---------------------------------------------
-static bool appendRuntimeSourcesOrFail(arklang::hud::Hud& hud,
-                                       std::vector<std::string>& args,
-                                       llvm::StringRef runtimeRoot,
-                                       const std::vector<std::string>& relPaths) {
-    bool ok = true;
-
-    for (const auto& rel : relPaths) {
-        const std::string abs = joinPath(runtimeRoot, rel);
-        if (!fileExists(abs)) {
-            hud.error("Runtime source missing: " + abs);
-            ok = false;
-            continue;
-        }
-        args.push_back(abs);
-    }
-
-    return ok;
-}
-
-// ---------------------------------------------
-// MSVC / platform linker flag helpers
-// ---------------------------------------------
 static void appendMsvcLinkerFlag(std::vector<std::string>& args, llvm::StringRef flag) {
     args.push_back("-Xlinker");
     args.push_back(flag.str());
@@ -256,74 +321,34 @@ static void appendPlatformLinkFlags(std::vector<std::string>& args, ToolchainKin
     }
 }
 
-// ---------------------------------------------
-// Linker
-// ---------------------------------------------
-Linker::Linker(arklang::hud::Hud& hud, const LinkerConfig& config)
-    : hud_(hud), cfg_(config) {}
-
-std::vector<std::string> Linker::getRuntimeSources() const {
-    std::vector<std::string> v = {
-        "core/async.cpp",
-        "core/memory.cpp",
-        "core/string.cpp",
-        "core/panic.cpp",
-        "core/print.cpp",
-        "core/hash.cpp",
-        "core/vector.cpp",
-        "core/gpu_hal.cpp",
-        "net/remote.cpp",
-    };
-
-    if (cfg_.toolchain == ToolchainKind::MSVC || cfg_.toolchain == ToolchainKind::MinGW) {
-        v.push_back("fs/fs_win.cpp");
-        v.push_back("sys/sys_win.cpp");
-        v.push_back("net/socket_win.cpp");
-    } else {
-        v.push_back("fs/fs_posix.cpp");
-        v.push_back("sys/sys_posix.cpp");
-        v.push_back("net/socket_posix.cpp");
-    }
-
-    return v;
-}
-
-static std::string parentDirOf(llvm::StringRef path) {
-    if (path.empty()) {
-        return "";
-    }
-
-    llvm::SmallString<256> p(path);
-    if (!llvm::sys::fs::is_directory(p)) {
-        llvm::sys::path::remove_filename(p);
-    }
-    return std::string(p.str());
-}
-
-static void pushUniqueDir(std::vector<std::string>& out, llvm::StringRef dir) {
-    if (dir.empty()) {
+static void appendRuntimeRPathFlags(std::vector<std::string>& args, ToolchainKind toolchain) {
+    if (toolchain == ToolchainKind::Apple) {
+        args.push_back("-Wl,-rpath,@loader_path");
         return;
     }
 
-    const std::string s = std::string(dir);
-    if (std::find(out.begin(), out.end(), s) == out.end()) {
-        out.push_back(s);
+    if (toolchain == ToolchainKind::Generic || toolchain == ToolchainKind::MinGW) {
+        args.push_back("-Wl,-rpath,$ORIGIN");
     }
 }
 
 static std::vector<std::string> configuredToolRoots(const LinkerConfig& cfg) {
     std::vector<std::string> roots;
 
-    if (!cfg.clangOverride.empty()) {
-        pushUniqueDir(roots, parentDirOf(cfg.clangOverride));
-    }
-
-    if (!cfg.mlirTranslateOverride.empty()) {
-        pushUniqueDir(roots, parentDirOf(cfg.mlirTranslateOverride));
+    if (!cfg.toolchainRoot.empty()) {
+        pushUnique(roots, joinPath(cfg.toolchainRoot, "bin"));
     }
 
     if (!cfg.llvmBinDir.empty()) {
-        pushUniqueDir(roots, cfg.llvmBinDir);
+        pushUnique(roots, cfg.llvmBinDir);
+    }
+
+    if (!cfg.clangOverride.empty()) {
+        pushUnique(roots, parentDirOf(cfg.clangOverride));
+    }
+
+    if (!cfg.mlirTranslateOverride.empty()) {
+        pushUnique(roots, parentDirOf(cfg.mlirTranslateOverride));
     }
 
     return roots;
@@ -332,32 +357,20 @@ static std::vector<std::string> configuredToolRoots(const LinkerConfig& cfg) {
 static std::string findNamedToolInRoots(const std::vector<std::string>& roots, const std::string& name) {
     for (const auto& root : roots) {
         for (const auto& candidate : executableCandidates(name)) {
-            const std::string p = joinPath(root, candidate);
-            if (fileExists(p)) {
+            if (auto p = findFileInDir(root, candidate); !p.empty()) {
                 return p;
             }
         }
     }
-
-    return "";
-}
-
-static bool pathLooksLikeVcpkgBundledLlvm(llvm::StringRef path) {
-    const std::string s = lowerCopy(std::string(path));
-#if defined(_WIN32)
-    return s.find("\\vcpkg\\installed\\") != std::string::npos &&
-           s.find("\\tools\\llvm\\") != std::string::npos;
-#else
-    return s.find("/vcpkg/installed/") != std::string::npos &&
-           s.find("/tools/llvm/") != std::string::npos;
-#endif
+    return {};
 }
 
 static bool hasConfiguredToolRoots(const LinkerConfig& cfg) {
     return
+        !cfg.toolchainRoot.empty() ||
+        !cfg.llvmBinDir.empty() ||
         !cfg.clangOverride.empty() ||
-        !cfg.mlirTranslateOverride.empty() ||
-        !cfg.llvmBinDir.empty();
+        !cfg.mlirTranslateOverride.empty();
 }
 
 static std::string findConfiguredCompilerInRoots(const std::vector<std::string>& roots,
@@ -366,81 +379,19 @@ static std::string findConfiguredCompilerInRoots(const std::vector<std::string>&
         if (auto p = findNamedToolInRoots(roots, "clang++"); !p.empty()) return p;
         if (auto p = findNamedToolInRoots(roots, "clang"); !p.empty()) return p;
         if (auto p = findNamedToolInRoots(roots, "clang-cl"); !p.empty()) return p;
-        return "";
+        return {};
     }
 
     if (auto p = findNamedToolInRoots(roots, "clang++"); !p.empty()) return p;
     if (auto p = findNamedToolInRoots(roots, "clang"); !p.empty()) return p;
-    return "";
-}
-
-std::string Linker::findTool(const std::string& name) {
-    if (name == "clang" && !cfg_.clangOverride.empty() && fileExists(cfg_.clangOverride)) {
-        return cfg_.clangOverride;
-    }
-
-    if (name == "mlir-translate" &&
-        !cfg_.mlirTranslateOverride.empty() &&
-        fileExists(cfg_.mlirTranslateOverride)) {
-        return cfg_.mlirTranslateOverride;
-    }
-
-    const std::vector<std::string> roots = configuredToolRoots(cfg_);
-
-    if (auto p = findNamedToolInRoots(roots, name); !p.empty()) {
-        return p;
-    }
-
-    if (hasConfiguredToolRoots(cfg_)) {
-        hud_.error("Configured LLVM tool not found: " + name);
-        return "";
-    }
-
-    return findProgramByNamePortable(name);
-}
-
-std::string Linker::findCompilerExe() {
-    hud_.debug("llvmBinDir=[" + cfg_.llvmBinDir + "]");
-    hud_.debug("clangOverride=[" + cfg_.clangOverride + "]");
-    hud_.debug("mlirTranslateOverride=[" + cfg_.mlirTranslateOverride + "]");
-
-    const std::vector<std::string> roots = configuredToolRoots(cfg_);
-    for (const auto& root : roots) {
-        hud_.debug("toolRoot=[" + root + "]");
-    }
-
-    if (!cfg_.clangOverride.empty() && fileExists(cfg_.clangOverride)) {
-        return cfg_.clangOverride;
-    }
-
-    if (auto p = findConfiguredCompilerInRoots(roots, cfg_.toolchain); !p.empty()) {
-        return p;
-    }
-
-    if (cfg_.toolchain == ToolchainKind::MSVC) {
-        if (auto p = findProgramByNamePortable("clang-cl"); !p.empty()) {
-            if (pathLooksLikeVcpkgBundledLlvm(p) && cfg_.llvmBinDir.empty()) {
-                hud_.error("Selected vcpkg-bundled Clang toolchain: " + p);
-                return "";
-            }
-            return p;
-        }
-
-        if (auto p = findProgramByNamePortable("clang++"); !p.empty()) return p;
-        if (auto p = findProgramByNamePortable("clang"); !p.empty()) return p;
-        return "";
-    }
-
-    if (auto p = findProgramByNamePortable("clang++"); !p.empty()) return p;
-    if (auto p = findProgramByNamePortable("clang"); !p.empty()) return p;
-    return "";
+    return {};
 }
 
 static std::string chooseWindowsIrDriver(const std::string& compilerPath,
                                          const LinkerConfig& cfg,
                                          bool needCxx) {
     if (compilerPath.empty()) {
-        return "";
+        return {};
     }
 
     if (!looksLikeClangCl(compilerPath)) {
@@ -451,8 +402,7 @@ static std::string chooseWindowsIrDriver(const std::string& compilerPath,
     llvm::sys::path::remove_filename(dir);
 
     auto sibling = [&](const char* name) -> std::string {
-        const std::string p = joinPath(dir, name);
-        return fileExists(p) ? p : std::string();
+        return findFileInDir(dir, name);
     };
 
     if (needCxx) {
@@ -476,17 +426,349 @@ static std::string chooseWindowsIrDriver(const std::string& compilerPath,
     }
 
     if (auto p = findProgramByNamePortable("clang"); !p.empty()) return p;
-    return "";
+    return {};
 }
 
+static std::string defaultStaticRuntimeLibName(ToolchainKind toolchain) {
+    if (toolchain == ToolchainKind::MSVC) {
+        return "ark_runtime_static.lib";
+    }
+    if (toolchain == ToolchainKind::Apple) {
+        return "libark_runtime.a";
+    }
+    if (toolchain == ToolchainKind::MinGW) {
+        return "libark_runtime.a";
+    }
+    return "libark_runtime.a";
+}
 
-std::string Linker::chooseLinkerExe(const std::string& compilerPath) {
-    if (compilerPath.empty()) {
-        return "";
+static std::string defaultSharedRuntimeLibName(ToolchainKind toolchain) {
+    if (toolchain == ToolchainKind::MSVC) {
+        return "ark_runtime.dll";
+    }
+    if (toolchain == ToolchainKind::Apple) {
+        return "libark_runtime.dylib";
+    }
+    if (toolchain == ToolchainKind::MinGW) {
+        return "libark_runtime.dll";
+    }
+    return "libark_runtime.so";
+}
+
+static std::string defaultImportRuntimeLibName(ToolchainKind toolchain) {
+    if (toolchain == ToolchainKind::MSVC) {
+        return "ark_runtime.lib";
+    }
+    if (toolchain == ToolchainKind::MinGW) {
+        return "libark_runtime.dll.a";
+    }
+    return {};
+}
+
+// ---------------------------------------------
+// Linker
+// ---------------------------------------------
+Linker::Linker(arklang::hud::Hud& hud, const LinkerConfig& config)
+    : hud_(hud), cfg_(config) {}
+
+std::optional<ToolchainLayout> Linker::resolveToolchainLayout() const {
+    ToolchainLayout layout;
+
+    if (!cfg_.toolchainRoot.empty()) {
+        layout.rootDir = canonicalizePath(cfg_.toolchainRoot);
+    } else if (!cfg_.llvmBinDir.empty()) {
+        layout.rootDir = canonicalizePath(parentDirOf(cfg_.llvmBinDir));
+    } else if (!cfg_.clangOverride.empty()) {
+        layout.rootDir = canonicalizePath(grandParentDirOf(cfg_.clangOverride));
+    } else if (!cfg_.mlirTranslateOverride.empty()) {
+        layout.rootDir = canonicalizePath(grandParentDirOf(cfg_.mlirTranslateOverride));
+    }
+
+    if (!cfg_.llvmBinDir.empty()) {
+        layout.binDir = canonicalizePath(cfg_.llvmBinDir);
+    } else if (!layout.rootDir.empty()) {
+        layout.binDir = canonicalizePath(joinPath(layout.rootDir, "bin"));
+    }
+
+    if (!cfg_.runtimeLibDirOverride.empty()) {
+        layout.libDir = canonicalizePath(cfg_.runtimeLibDirOverride);
+    } else if (!layout.rootDir.empty()) {
+        layout.libDir = canonicalizePath(joinPath(layout.rootDir, "lib"));
+    }
+
+    if (!cfg_.runtimeIncludeDirOverride.empty()) {
+        layout.includeDir = canonicalizePath(cfg_.runtimeIncludeDirOverride);
+    } else if (!layout.rootDir.empty()) {
+        layout.includeDir = canonicalizePath(joinPath(layout.rootDir, "include"));
+    }
+
+    if (!cfg_.runtimeBinDirOverride.empty()) {
+        layout.runtimeBinDir = canonicalizePath(cfg_.runtimeBinDirOverride);
+    } else if (!layout.binDir.empty()) {
+        layout.runtimeBinDir = layout.binDir;
+    }
+
+    if (!cfg_.clangOverride.empty() && fileExists(cfg_.clangOverride)) {
+        layout.clangPath = canonicalizePath(cfg_.clangOverride);
+    } else if (!layout.binDir.empty()) {
+        layout.clangPath = findNamedToolInRoots({layout.binDir}, "clang");
+    }
+
+    if (!layout.binDir.empty()) {
+        layout.clangxxPath = findNamedToolInRoots({layout.binDir}, "clang++");
+        layout.clangClPath = findNamedToolInRoots({layout.binDir}, "clang-cl");
+    }
+
+    if (!cfg_.mlirTranslateOverride.empty() && fileExists(cfg_.mlirTranslateOverride)) {
+        layout.mlirTranslatePath = canonicalizePath(cfg_.mlirTranslateOverride);
+    } else if (!layout.binDir.empty()) {
+        layout.mlirTranslatePath = findNamedToolInRoots({layout.binDir}, "mlir-translate");
+    }
+
+    if (!layout.binDir.empty()) {
+        if (cfg_.toolchain == ToolchainKind::MSVC) {
+            layout.lldPath = findNamedToolInRoots({layout.binDir}, "lld-link");
+        } else {
+            if (auto p = findNamedToolInRoots({layout.binDir}, "ld.lld"); !p.empty()) layout.lldPath = p;
+            else layout.lldPath = findNamedToolInRoots({layout.binDir}, "lld");
+        }
+    }
+
+    if (!cfg_.runtimeStaticLibOverride.empty()) {
+        layout.runtimeStaticLibPath = canonicalizePath(cfg_.runtimeStaticLibOverride);
+    } else if (!layout.libDir.empty()) {
+        layout.runtimeStaticLibPath = findFileInDir(layout.libDir, defaultStaticRuntimeLibName(cfg_.toolchain));
+    }
+
+    if (!cfg_.runtimeSharedLibOverride.empty()) {
+        layout.runtimeSharedLibPath = canonicalizePath(cfg_.runtimeSharedLibOverride);
+    } else {
+        const std::string dir =
+            !layout.runtimeBinDir.empty() ? layout.runtimeBinDir : layout.libDir;
+        if (!dir.empty()) {
+            layout.runtimeSharedLibPath = findFileInDir(dir, defaultSharedRuntimeLibName(cfg_.toolchain));
+        }
+    }
+
+    if (!cfg_.runtimeImportLibOverride.empty()) {
+        layout.runtimeImportLibPath = canonicalizePath(cfg_.runtimeImportLibOverride);
+    } else if (!layout.libDir.empty()) {
+        const std::string name = defaultImportRuntimeLibName(cfg_.toolchain);
+        if (!name.empty()) {
+            layout.runtimeImportLibPath = findFileInDir(layout.libDir, name);
+        }
+    }
+
+    if (!cfg_.linkerConfigOverride.empty()) {
+        layout.linkerConfigPath = canonicalizePath(cfg_.linkerConfigOverride);
+    } else if (!layout.libDir.empty()) {
+        layout.linkerConfigPath = findFileInDir(layout.libDir, "linker-config.json");
+    }
+
+    if (!layout.rootDir.empty()) {
+        layout.manifestPath = findFileInDir(layout.rootDir, "manifest.json");
+    }
+
+    if (layout.rootDir.empty() &&
+        layout.binDir.empty() &&
+        layout.libDir.empty() &&
+        layout.includeDir.empty()) {
+        return std::nullopt;
+    }
+
+    return layout;
+}
+
+std::optional<RuntimeArtifacts> Linker::resolveRuntimeArtifacts(const ToolchainLayout& layout) const {
+    RuntimeArtifacts out;
+
+    out.includeDir = !cfg_.runtimeIncludeDirOverride.empty()
+        ? canonicalizePath(cfg_.runtimeIncludeDirOverride)
+        : layout.includeDir;
+
+    if (!dirExists(out.includeDir)) {
+        hud_.error("Runtime include directory missing: " + out.includeDir);
+        return std::nullopt;
+    }
+
+    out.staticLibPath = !cfg_.runtimeStaticLibOverride.empty()
+        ? canonicalizePath(cfg_.runtimeStaticLibOverride)
+        : layout.runtimeStaticLibPath;
+
+    out.sharedLibPath = !cfg_.runtimeSharedLibOverride.empty()
+        ? canonicalizePath(cfg_.runtimeSharedLibOverride)
+        : layout.runtimeSharedLibPath;
+
+    out.importLibPath = !cfg_.runtimeImportLibOverride.empty()
+        ? canonicalizePath(cfg_.runtimeImportLibOverride)
+        : layout.runtimeImportLibPath;
+
+    out.binDir = !cfg_.runtimeBinDirOverride.empty()
+        ? canonicalizePath(cfg_.runtimeBinDirOverride)
+        : layout.runtimeBinDir;
+
+    const bool preferShared = cfg_.preferSharedRuntime;
+
+    if (cfg_.toolchain == ToolchainKind::MSVC) {
+        if (preferShared) {
+            if (fileExists(out.importLibPath)) {
+                out.extraLinkInputs.push_back(out.importLibPath);
+                if (fileExists(out.sharedLibPath)) {
+                    out.runtimeFilesToStage.push_back(out.sharedLibPath);
+                }
+                return out;
+            }
+
+            if (fileExists(out.staticLibPath)) {
+                out.extraLinkInputs.push_back(out.staticLibPath);
+                return out;
+            }
+        } else {
+            if (fileExists(out.staticLibPath)) {
+                out.extraLinkInputs.push_back(out.staticLibPath);
+                return out;
+            }
+
+            if (fileExists(out.importLibPath)) {
+                out.extraLinkInputs.push_back(out.importLibPath);
+                if (fileExists(out.sharedLibPath)) {
+                    out.runtimeFilesToStage.push_back(out.sharedLibPath);
+                }
+                return out;
+            }
+        }
+
+        hud_.error("No usable packaged runtime library found");
+        return std::nullopt;
+    }
+
+    if (preferShared) {
+        if (fileExists(out.sharedLibPath)) {
+            out.extraLinkInputs.push_back(out.sharedLibPath);
+            out.runtimeFilesToStage.push_back(out.sharedLibPath);
+            return out;
+        }
+
+        if (fileExists(out.staticLibPath)) {
+            out.extraLinkInputs.push_back(out.staticLibPath);
+            return out;
+        }
+    } else {
+        if (fileExists(out.staticLibPath)) {
+            out.extraLinkInputs.push_back(out.staticLibPath);
+            return out;
+        }
+
+        if (fileExists(out.sharedLibPath)) {
+            out.extraLinkInputs.push_back(out.sharedLibPath);
+            out.runtimeFilesToStage.push_back(out.sharedLibPath);
+            return out;
+        }
+    }
+
+    hud_.error("No usable packaged runtime library found");
+    return std::nullopt;
+}
+
+std::string Linker::findTool(const std::string& name) {
+    if (name == "clang" && !cfg_.clangOverride.empty() && fileExists(cfg_.clangOverride)) {
+        return canonicalizePath(cfg_.clangOverride);
+    }
+
+    if (name == "mlir-translate" &&
+        !cfg_.mlirTranslateOverride.empty() &&
+        fileExists(cfg_.mlirTranslateOverride)) {
+        return canonicalizePath(cfg_.mlirTranslateOverride);
+    }
+
+    if (auto layout = resolveToolchainLayout()) {
+        if (name == "clang" && !layout->clangPath.empty()) {
+            return layout->clangPath;
+        }
+        if (name == "clang++" && !layout->clangxxPath.empty()) {
+            return layout->clangxxPath;
+        }
+        if (name == "clang-cl" && !layout->clangClPath.empty()) {
+            return layout->clangClPath;
+        }
+        if (name == "mlir-translate" && !layout->mlirTranslatePath.empty()) {
+            return layout->mlirTranslatePath;
+        }
+        if ((name == "lld" || name == "ld.lld" || name == "lld-link") && !layout->lldPath.empty()) {
+            return layout->lldPath;
+        }
+    }
+
+    const std::vector<std::string> roots = configuredToolRoots(cfg_);
+
+    if (auto p = findNamedToolInRoots(roots, name); !p.empty()) {
+        return p;
+    }
+
+    if (hasConfiguredToolRoots(cfg_)) {
+        hud_.error("Configured LLVM tool not found: " + name);
+        return {};
+    }
+
+    return findProgramByNamePortable(name);
+}
+
+std::string Linker::findCompilerExe() {
+    hud_.debug("toolchainRoot=[" + cfg_.toolchainRoot + "]");
+    hud_.debug("llvmBinDir=[" + cfg_.llvmBinDir + "]");
+    hud_.debug("clangOverride=[" + cfg_.clangOverride + "]");
+    hud_.debug("mlirTranslateOverride=[" + cfg_.mlirTranslateOverride + "]");
+
+    const std::vector<std::string> roots = configuredToolRoots(cfg_);
+    for (const auto& root : roots) {
+        hud_.debug("toolRoot=[" + root + "]");
+    }
+
+    if (!cfg_.clangOverride.empty() && fileExists(cfg_.clangOverride)) {
+        return canonicalizePath(cfg_.clangOverride);
+    }
+
+    if (auto layout = resolveToolchainLayout()) {
+        if (cfg_.toolchain == ToolchainKind::MSVC) {
+            if (!layout->clangClPath.empty()) return layout->clangClPath;
+            if (!layout->clangxxPath.empty()) return layout->clangxxPath;
+            if (!layout->clangPath.empty()) return layout->clangPath;
+        } else {
+            if (!layout->clangxxPath.empty()) return layout->clangxxPath;
+            if (!layout->clangPath.empty()) return layout->clangPath;
+        }
+    }
+
+    if (auto p = findConfiguredCompilerInRoots(roots, cfg_.toolchain); !p.empty()) {
+        return p;
     }
 
     if (cfg_.toolchain == ToolchainKind::MSVC) {
-        const std::string gnu = chooseWindowsIrDriver(compilerPath, cfg_, /*needCxx=*/true);
+        if (auto p = findProgramByNamePortable("clang-cl"); !p.empty()) {
+            if (pathLooksLikeVcpkgBundledLlvm(p) && cfg_.llvmBinDir.empty() && cfg_.toolchainRoot.empty()) {
+                hud_.error("Selected vcpkg-bundled Clang toolchain: " + p);
+                return {};
+            }
+            return p;
+        }
+
+        if (auto p = findProgramByNamePortable("clang++"); !p.empty()) return p;
+        if (auto p = findProgramByNamePortable("clang"); !p.empty()) return p;
+        return {};
+    }
+
+    if (auto p = findProgramByNamePortable("clang++"); !p.empty()) return p;
+    if (auto p = findProgramByNamePortable("clang"); !p.empty()) return p;
+    return {};
+}
+
+std::string Linker::chooseLinkerExe(const std::string& compilerPath) {
+    if (compilerPath.empty()) {
+        return {};
+    }
+
+    if (cfg_.toolchain == ToolchainKind::MSVC) {
+        const std::string gnu = chooseWindowsIrDriver(compilerPath, cfg_, true);
         return gnu.empty() ? compilerPath : gnu;
     }
 
@@ -504,7 +786,7 @@ std::string Linker::chooseLinkerExe(const std::string& compilerPath) {
         if (llvm::sys::fs::exists(q)) {
             return std::string(q.str());
         }
-        return "";
+        return {};
     };
 
     if (stem == "clang") {
@@ -664,15 +946,6 @@ EmbeddingResult Linker::createEmbeddingSource(const std::string& symbolPrefix,
     return {s, EmbeddingKind::Asm};
 }
 
-bool Linker::runtimeNeedsCxxLink() const {
-    for (const auto& src : getRuntimeSources()) {
-        if (isCppLikeSource(src)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool Linker::linkToBinary(const std::string& inputLl, const std::string& outputBin) {
     return linkToBinary(inputLl, outputBin, {});
 }
@@ -688,7 +961,19 @@ bool Linker::linkToBinary(
         return false;
     }
 
-    const std::vector<std::string> runtimeSources = getRuntimeSources();
+    const auto layout = resolveToolchainLayout();
+    if (!layout) {
+        hud_.error("Toolchain layout could not be resolved");
+        return false;
+    }
+
+    const auto runtime = resolveRuntimeArtifacts(*layout);
+    if (!runtime) {
+        if (cfg_.devSourceRuntimeFallback) {
+            hud_.error("Source-runtime fallback is disabled in the packaged linker path");
+        }
+        return false;
+    }
 
     std::vector<std::string> fatbinSources;
     std::string fatbinTmpDir;
@@ -706,7 +991,7 @@ bool Linker::linkToBinary(
         }
     }
 
-    const bool needCxx = runtimeNeedsCxxLink() || endsWithAnyCppLike(fatbinSources);
+    const bool needCxx = endsWithAnyCppLike(fatbinSources);
 
     std::string driverExe = chooseLinkerExe(compilerExe);
     if (driverExe.empty()) {
@@ -719,8 +1004,8 @@ bool Linker::linkToBinary(
 
     std::vector<std::string> args;
     args.reserve(
-        8 +
-        runtimeSources.size() +
+        16 +
+        runtime->extraLinkInputs.size() +
         fatbinSources.size()
     );
 
@@ -747,30 +1032,34 @@ bool Linker::linkToBinary(
         args.push_back(inputLl);
     }
 
-    args.push_back("-I");
-    args.push_back(cfg_.runtimePath);
-    args.push_back("-I");
-    args.push_back(joinPath(cfg_.runtimePath, "include"));
-
-    if (!appendRuntimeSourcesOrFail(hud_, args, cfg_.runtimePath, runtimeSources)) {
-        if (!cfg_.keepTmp && !fatbinTmpDir.empty()) {
-            removeDirTree(fatbinTmpDir);
-        }
-        return false;
+    if (!runtime->includeDir.empty()) {
+        args.push_back("-I");
+        args.push_back(runtime->includeDir);
     }
 
     for (const auto& src : fatbinSources) {
         args.push_back(src);
     }
 
+    for (const auto& lib : runtime->extraLinkInputs) {
+        args.push_back(lib);
+    }
+
     args = filterIrLinkFlags(args);
 
-    args.push_back("-std=c++20");
+    if (needCxx) {
+        args.push_back("-std=c++20");
+    }
+
     args.push_back("-g");
     args.push_back("-O0");
 
     appendFatbinExportFlags(args, cfg_.toolchain);
     appendPlatformLinkFlags(args, cfg_.toolchain);
+
+    if (!runtime->runtimeFilesToStage.empty()) {
+        appendRuntimeRPathFlags(args, cfg_.toolchain);
+    }
 
     args.push_back("-o");
     args.push_back(outputBin);
@@ -781,11 +1070,23 @@ bool Linker::linkToBinary(
 
     const int rc = runCmd(driverExe, args, "linker");
 
+    bool stagedOk = true;
+    if (rc == 0 && !runtime->runtimeFilesToStage.empty()) {
+        const std::string outDir = parentDirOf(outputBin);
+        for (const auto& src : runtime->runtimeFilesToStage) {
+            const std::string dst = joinPath(outDir, llvm::sys::path::filename(src));
+            if (!copyFileReplace(src, dst)) {
+                hud_.error("Failed to stage runtime artifact: " + src);
+                stagedOk = false;
+            }
+        }
+    }
+
     if (!cfg_.keepTmp && !fatbinTmpDir.empty()) {
         removeDirTree(fatbinTmpDir);
     }
 
-    return rc == 0;
+    return rc == 0 && stagedOk;
 }
 
 std::string Linker::makeTempDir() {

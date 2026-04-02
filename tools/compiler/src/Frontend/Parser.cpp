@@ -124,33 +124,46 @@ void Parser::watchdog(const char* loopName, size_t& lastPos) {
 
 std::unique_ptr<Module> Parser::parseModule() {
     auto mod = std::make_unique<Module>();
-    size_t lastPos = -1;
+    size_t lastPos = static_cast<size_t>(-1);
 
     while (!isAtEnd()) {
         watchdog("parseModule", lastPos);
-        
-        auto decl = parseTopLevel();
-        if (decl) {
-            // RTTI Cast to store in specific vectors
-            if (auto* fn = dynamic_cast<Function*>(decl.get())) {
-                decl.release(); // Release ownership from generic unique_ptr
-                mod->functions.push_back(std::unique_ptr<Function>(fn));
+
+        if (match(TokenType::KwSingleton)) {
+            if (match(TokenType::KwSchema)) {
+                if (auto schema = parseSchema(true)) {
+                    mod->schemas.push_back(std::move(schema));
+                }
+            } else {
+                errorAt(peek().loc, "Expected 'schema' after 'singleton'");
             }
-            else if (auto* sc = dynamic_cast<SchemaDecl*>(decl.get())) {
-                decl.release();
-                mod->schemas.push_back(std::unique_ptr<SchemaDecl>(sc));
+        } else if (check(TokenType::KwSchema)) {
+            consume(TokenType::KwSchema, "");
+
+            const bool isSingleton = match(TokenType::KwSingleton);
+            if (auto schema = parseSchema(isSingleton)) {
+                mod->schemas.push_back(std::move(schema));
             }
-            else if (auto* imp = dynamic_cast<ImportDecl*>(decl.get())) {
-                decl.release();
-                mod->imports.push_back(std::unique_ptr<ImportDecl>(imp));
+        } else if (match(TokenType::KwImport)) {
+            if (auto importDecl = parseImport()) {
+                mod->imports.push_back(std::move(importDecl));
             }
-        } else if (!panicMode) {
-            // If parseTopLevel failed but didn't advance/panic, force advance to avoid infinite loop
-            if (current == lastPos) advance();
+        } else if (match(TokenType::KwFn)) {
+            if (auto fn = parseFunction()) {
+                mod->functions.push_back(std::move(fn));
+            }
+        } else {
+            errorAt(peek().loc, "Expected import, function, schema, or singleton declaration");
+            if (!isAtEnd()) {
+                advance();
+            }
         }
 
-        if (panicMode) synchronize();
+        if (panicMode) {
+            synchronize();
+        }
     }
+
     return mod;
 }
 
