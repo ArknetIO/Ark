@@ -139,7 +139,6 @@ set(LLVM_LINK_COMPONENTS
   TransformUtils
 )
 
-# Host JIT stays optional, but if present we use it.
 ark_has_imported_artifact(ARK_HAVE_LLVM_ORCJIT LLVMOrcJIT)
 ark_has_imported_artifact(ARK_HAVE_LLVM_EXECUTIONENGINE LLVMExecutionEngine)
 ark_has_imported_artifact(ARK_HAVE_MLIR_EXECUTIONENGINE MLIRExecutionEngine)
@@ -347,13 +346,11 @@ set(ARK_GENMIR_SOURCES
 set(ARK_COMPILER_SHARED_SOURCES
   src/Support/Hud.cpp
 
-  # Modular Pipeline
   src/Pipeline/Compiler.cpp
   src/Pipeline/Linker.cpp
   src/Pipeline/LinkerGpuFatbin.cpp
   src/Integration/CapsuleBackend.cpp
 
-  # Frontend
   src/Frontend/Lexer.cpp
   src/Frontend/Parser.cpp
   ${ARK_GENMIR_SOURCES}
@@ -361,22 +358,18 @@ set(ARK_COMPILER_SHARED_SOURCES
   src/Frontend/BuiltinNamespaces.cpp
   src/Frontend/Intrinsics.cpp
 
-  # Middle-End
   src/Analysis/OwnershipVerifier.cpp
   src/Analysis/OwnershipUtils.cpp
   src/Transforms/DropInsertion.cpp
 
-  # GPU / ABI passes
   src/Transforms/GpuLowering.cpp
   src/Transforms/GpuKernelOutlining.cpp
   src/Transforms/RuntimeABIVerifier.cpp
 
-  # Runtime Manager
   src/Frontend/RuntimeManager.cpp
   src/Frontend/ModuleRegistry.cpp
   src/Frontend/SymbolRegistry.cpp
 
-  # Runtime Source Injection
   ${RUNTIME_CORE_SOURCES}
 )
 
@@ -391,21 +384,27 @@ else()
 endif()
 
 # =========================================================
-# 8. Build Targets
+# 8. Common Source Policy Helpers
 # =========================================================
-add_ark_tool(arknet
-  src/CLI/Main.cpp
-  src/CLI/Init.cpp
-  src/CLI/Common.cpp
-  src/CLI/Compile.cpp
-  src/CLI/Registry.cpp
-  src/CLI/Lsp.cpp
-  src/CLI/Provider.cpp
-  src/CLI/Config.cpp
-  src/CLI/Doctor.cpp
-  src/CLI/Workspace.cpp
-  ${ARK_COMPILER_SHARED_SOURCES}
-)
+function(ark_enable_exceptions_for_sources)
+  foreach(_src IN LISTS ARGN)
+    if(MSVC)
+      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "/EHsc")
+    else()
+      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "-fexceptions")
+    endif()
+  endforeach()
+endfunction()
+
+function(ark_enable_rtti_for_sources)
+  foreach(_src IN LISTS ARGN)
+    if(MSVC)
+      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "/GR")
+    else()
+      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "-frtti")
+    endif()
+  endforeach()
+endfunction()
 
 # =========================================================
 # 9. Common Target Configuration
@@ -447,8 +446,6 @@ function(ark_fix_msvc_cpp_mode target_name)
     COMPILE_OPTIONS "${_clean_opts}"
     COMPILE_FLAGS   "${_flags}"
   )
-
-  target_compile_options(${target_name} PRIVATE /EHsc /GR)
 endfunction()
 
 if(DEFINED LLVM_DIR AND NOT LLVM_DIR STREQUAL "")
@@ -456,6 +453,39 @@ if(DEFINED LLVM_DIR AND NOT LLVM_DIR STREQUAL "")
 else()
   set(ARK_DEFAULT_LLVM_BIN_DIR "")
 endif()
+
+# =========================================================
+# 10. Build Targets
+# =========================================================
+set(ARKNET_CLI_SOURCES
+  src/CLI/Main.cpp
+  src/CLI/Init.cpp
+  src/CLI/Common.cpp
+  src/CLI/Compile.cpp
+  src/CLI/Registry.cpp
+  src/CLI/Lsp.cpp
+  src/CLI/Provider.cpp
+  src/CLI/Config.cpp
+  src/CLI/Doctor.cpp
+  src/CLI/Workspace.cpp
+)
+
+set(ARKNET_EXCEPTION_SOURCES
+  ${ARKNET_CLI_SOURCES}
+  ${ARK_GENMIR_SOURCES}
+)
+
+set(ARKNET_RTTI_SOURCES
+  ${ARK_GENMIR_SOURCES}
+)
+
+add_ark_tool(arknet
+  ${ARKNET_CLI_SOURCES}
+  ${ARK_COMPILER_SHARED_SOURCES}
+)
+
+ark_enable_exceptions_for_sources(${ARKNET_EXCEPTION_SOURCES})
+ark_enable_rtti_for_sources(${ARKNET_RTTI_SOURCES})
 
 foreach(TOOL_TARGET arknet)
 
@@ -494,6 +524,13 @@ foreach(TOOL_TARGET arknet)
     ${ARK_PLATFORM_LINK_LIBS}
     ${ARK_PLATFORM_DL_LIBS}
   )
+
+  if(WIN32)
+    target_compile_definitions(${TOOL_TARGET} PRIVATE
+      NOMINMAX
+      WIN32_LEAN_AND_MEAN
+    )
+  endif()
 
   if(ARK_ENABLE_HOST_JIT)
     target_compile_definitions(${TOOL_TARGET} PRIVATE ARK_ENABLE_HOST_JIT=1)
@@ -547,7 +584,7 @@ target_link_libraries(arknet PRIVATE
 )
 
 # =========================================================
-# 10. Build the Capsule Stub (ark-stub)
+# 11. Build the Capsule Stub (ark-stub)
 # =========================================================
 add_executable(ark-stub src/Runner/Stub.cpp)
 target_compile_definitions(ark-stub PRIVATE ARK_STUB_STANDALONE)
@@ -568,6 +605,10 @@ if(MSVC)
     $<$<CONFIG:RelWithDebInfo>:/O1>
     $<$<CONFIG:MinSizeRel>:/O1>
   )
+  target_compile_definitions(ark-stub PRIVATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+  )
 else()
   target_compile_options(ark-stub PRIVATE
     $<$<CONFIG:Release>:-Os>
@@ -585,12 +626,12 @@ else()
 endif()
 
 # =========================================================
-# 11. Installation
+# 12. Installation
 # =========================================================
 install(TARGETS arknet ark-stub DESTINATION bin)
 
 # =========================================================
-# 12. Runtime Headers Preparation
+# 13. Runtime Headers Preparation
 # =========================================================
 add_custom_target(PrepareRuntimeHeaders ALL
   COMMENT "Copying Protocol & ABI headers to Runtime/include..."
@@ -606,6 +647,6 @@ add_custom_target(PrepareRuntimeHeaders ALL
 )
 
 # =========================================================
-# 13. GPU Plugins (SHARED)
+# 14. GPU Plugins (SHARED)
 # =========================================================
 add_subdirectory(Runtime/gpu)

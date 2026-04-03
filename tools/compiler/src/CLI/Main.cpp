@@ -8,7 +8,6 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/Host.h>
 
-#include <exception>
 #include <string>
 
 #ifndef ARK_VERSION_STRING
@@ -20,6 +19,11 @@ namespace {
 enum class VersionFormat {
     Text,
     Json
+};
+
+struct TopLevelFlags {
+    bool showVersion = false;
+    bool showVersionJson = false;
 };
 
 static void printVersion(VersionFormat format) {
@@ -47,33 +51,24 @@ static void printVersion(VersionFormat format) {
 static void registerVersionCmd(CLI::App& app) {
     CLI::App* cmd = app.add_subcommand("version", "Print version information");
 
-    CLI::Option* jsonOpt = cmd->add_flag(
-        "--json",
-        "Print version information as JSON"
-    );
+    bool asJson = false;
+    cmd->add_flag("--json", asJson, "Print version information as JSON");
 
-    cmd->callback([jsonOpt]() {
-        const bool asJson = jsonOpt != nullptr && jsonOpt->count() > 0;
+    cmd->callback([&asJson]() {
         printVersion(asJson ? VersionFormat::Json : VersionFormat::Text);
     });
 }
 
-static void registerTopLevelVersionFlags(CLI::App& app) {
-    app.add_flag_callback(
+static void registerTopLevelVersionFlags(CLI::App& app, TopLevelFlags& flags) {
+    app.add_flag(
         "-V,--version",
-        []() {
-            printVersion(VersionFormat::Text);
-            throw CLI::Success();
-        },
+        flags.showVersion,
         "Print version information and exit"
     );
 
-    app.add_flag_callback(
+    app.add_flag(
         "--version-json",
-        []() {
-            printVersion(VersionFormat::Json);
-            throw CLI::Success();
-        },
+        flags.showVersionJson,
         "Print version information as JSON and exit"
     );
 }
@@ -91,12 +86,12 @@ static void registerSubcommands(CLI::App& app) {
     ark::cli::setupProviderCmd(app);
 }
 
-static void configureApp(CLI::App& app) {
+static void configureApp(CLI::App& app, TopLevelFlags& flags) {
     app.set_help_flag("-h,--help", "Show help");
     app.set_help_all_flag("--help-all", "Show help (including hidden options)");
     app.failure_message(CLI::FailureMessage::help);
 
-    registerTopLevelVersionFlags(app);
+    registerTopLevelVersionFlags(app, flags);
     registerSubcommands(app);
 }
 
@@ -106,23 +101,25 @@ int main(int argc, char** argv) {
     llvm::InitLLVM init(argc, argv);
 
     CLI::App app{"The Arknet Project"};
-    configureApp(app);
+    TopLevelFlags flags;
+    configureApp(app, flags);
 
     if (argc <= 1) {
         llvm::outs() << app.help();
         return 0;
     }
 
-    try {
-        app.parse(argc, argv);
+    CLI11_PARSE(app, argc, argv);
+
+    if (flags.showVersionJson) {
+        printVersion(VersionFormat::Json);
         return 0;
-    } catch (const CLI::ParseError& e) {
-        return app.exit(e);
-    } catch (const std::exception& e) {
-        llvm::errs() << "arknet: fatal error: " << e.what() << '\n';
-        return 1;
-    } catch (...) {
-        llvm::errs() << "arknet: fatal error: unknown exception\n";
-        return 1;
     }
+
+    if (flags.showVersion) {
+        printVersion(VersionFormat::Text);
+        return 0;
+    }
+
+    return 0;
 }

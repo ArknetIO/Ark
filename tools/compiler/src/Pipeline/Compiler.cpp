@@ -197,22 +197,30 @@ static void prepareCompilerContext(mlir::MLIRContext& ctx) {
 static void initLlvmTargetsOnce() {
     static std::once_flag once;
     std::call_once(once, [] {
-        llvm::InitializeAllTargetInfos();
-        llvm::InitializeAllTargets();
-        llvm::InitializeAllTargetMCs();
-        llvm::InitializeAllAsmPrinters();
-        llvm::InitializeAllAsmParsers();
+        if (llvm::InitializeNativeTarget()) {
+            llvm::report_fatal_error("Failed to initialize native LLVM target");
+        }
+        if (llvm::InitializeNativeTargetAsmPrinter()) {
+            llvm::report_fatal_error("Failed to initialize native LLVM asm printer");
+        }
+        if (llvm::InitializeNativeTargetAsmParser()) {
+            llvm::report_fatal_error("Failed to initialize native LLVM asm parser");
+        }
 
+#if ARK_ENABLE_NVPTX_GPU_PIPELINE
         LLVMInitializeNVPTXTarget();
         LLVMInitializeNVPTXTargetInfo();
         LLVMInitializeNVPTXTargetMC();
         LLVMInitializeNVPTXAsmPrinter();
+#endif
 
+#if ARK_ENABLE_AMDGPU_GPU_PIPELINE
         LLVMInitializeAMDGPUTarget();
         LLVMInitializeAMDGPUTargetInfo();
         LLVMInitializeAMDGPUTargetMC();
         LLVMInitializeAMDGPUAsmPrinter();
         LLVMInitializeAMDGPUAsmParser();
+#endif
     });
 }
 

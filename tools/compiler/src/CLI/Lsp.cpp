@@ -636,14 +636,15 @@ static std::unique_ptr<arklang::Module> parseModuleFromFileForIndex(const std::s
     const llvm::StringRef buf = (*mb)->getBuffer();
     std::string source(buf.data(), buf.size());
 
-    try {
-        arklang::Lexer lexer(std::move(source), path);
-        arklang::TokenStream tokens = lexer.tokenize();
-        arklang::Parser parser(std::move(tokens));
-        return parser.parseModule();
-    } catch (...) {
-        return nullptr;
-    }
+    arklang::Lexer lexer(std::move(source), path);
+    arklang::TokenStream tokens = lexer.tokenize();
+    if (!tokens.errors.empty()) return nullptr;
+
+    arklang::Parser parser(std::move(tokens));
+    auto mod = parser.parseModule();
+    if (parser.hasErrors()) return nullptr;
+
+    return mod;
 }
 
 // =============================================================================
@@ -780,21 +781,15 @@ public:
         state.text = text;
         state.parseFilename = filePathFromUri(uri).value_or(uri);
 
-        try {
-            arklang::Lexer lexer(text, state.parseFilename);
-            arklang::TokenStream tokens = lexer.tokenize();
+        arklang::Lexer lexer(text, state.parseFilename);
+        arklang::TokenStream tokens = lexer.tokenize();
 
-            if (!tokens.errors.empty()) {
-                state.errors = tokens.errors;
-            } else {
-                arklang::Parser parser(std::move(tokens));
-                state.ast = parser.parseModule();
-                state.errors = parser.getErrors();
-            }
-        } catch (const std::exception& e) {
-            state.errors.push_back(std::string("LSP frontend exception: ") + e.what());
-        } catch (...) {
-            state.errors.push_back("LSP frontend exception: unknown");
+        if (!tokens.errors.empty()) {
+            state.errors = tokens.errors;
+        } else {
+            arklang::Parser parser(std::move(tokens));
+            state.ast = parser.parseModule();
+            state.errors = parser.getErrors();
         }
 
         rebuildHeuristicSymbolIndex(state);
@@ -814,12 +809,11 @@ public:
 
         auto [it, _] = documents.insert_or_assign(uri, std::move(state));
         llvm::errs() << "[ARK LSP] Compiled document: " << uri
-                     << " (" << it->second.errors.size() << " errors, "
-                     << it->second.symbols.size() << " local symbols, "
-                     << it->second.topLevelDefs.size() << " top-level defs, "
-                     << it->second.importAliases.size() << " imports)\n";
+                    << " (" << it->second.errors.size() << " errors, "
+                    << it->second.symbols.size() << " local symbols, "
+                    << it->second.topLevelDefs.size() << " top-level defs, "
+                    << it->second.importAliases.size() << " imports)\n";
     }
-
 
     void closeDocument(const std::string& uri) {
         documents.erase(uri);

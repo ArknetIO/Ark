@@ -190,26 +190,27 @@ extern "C" {
     // =========================================================
 
     ArkStatus __ark_str_regex_match(ArkStr str, ArkStr pattern, bool* out_match) {
-        try {
-            std::regex re(view(pattern));
-            *out_match = std::regex_match(view(str), re);
-            return 0; // OK
-        } catch (...) {
-            return -1; // Regex Compile Error
-        }
+        if (!out_match) return -1;
+
+        const std::string input = view(str);
+        const std::string pat = view(pattern);
+
+        std::regex re(pat);
+        *out_match = std::regex_match(input, re);
+        return 0;
     }
 
     ArkStatus __ark_str_regex_replace(ArkStr str, ArkStr pattern, ArkStr replacement, ArkStr* out_res) {
-        try {
-            std::regex re(view(pattern));
-            std::string s = view(str);
-            std::string r = view(replacement);
-            std::string result = std::regex_replace(s, re, r);
-            *out_res = copy_to_ark(result);
-            return 0;
-        } catch (...) {
-            return -1;
-        }
+        if (!out_res) return -1;
+
+        const std::string input = view(str);
+        const std::string pat = view(pattern);
+        const std::string repl = view(replacement);
+
+        std::regex re(pat);
+        const std::string result = std::regex_replace(input, re, repl);
+        *out_res = copy_to_ark(result);
+        return 0;
     }
 
 } // extern "C"

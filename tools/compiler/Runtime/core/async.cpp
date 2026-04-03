@@ -9,19 +9,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <limits>  // [FIX] size_t bounds check
+#include <limits>
 #include <mutex>
-#include <random>  // [FIX] portable entropy
 #include <thread>
 #include <vector>
-#include <new>     // std::nothrow
+#include <new>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <intrin.h>
+#include <windows.h>
 #else
 #include <x86intrin.h>
 #endif
-
 
 extern "C" {
 
@@ -109,19 +111,35 @@ static inline std::uint64_t splitmix64(std::uint64_t x) noexcept {
 static std::atomic<std::uint64_t> g_cookie_ctr{1};
 static std::atomic<std::uint64_t> g_bad_completions{0}; // [METRICS] silent drop counter
 
-static inline std::uint64_t cookie_secret() noexcept {
-    // [FIX] One-time secret with best-effort entropy; never throws.
-    static const std::uint64_t s = []{
-        std::uint64_t r = 0;
-        try {
-            std::random_device rd;
-            const std::uint64_t hi = static_cast<std::uint64_t>(rd());
-            const std::uint64_t lo = static_cast<std::uint64_t>(rd());
-            r = (hi << 32) ^ lo;
-        } catch (...) {
-            r = 0;
-        }
+static inline std::uint64_t best_effort_entropy64() noexcept {
+#if defined(_WIN32)
+    LARGE_INTEGER qpc{};
+    (void)QueryPerformanceCounter(&qpc);
 
+    const std::uint64_t pid = static_cast<std::uint64_t>(GetCurrentProcessId());
+    const std::uint64_t tid = static_cast<std::uint64_t>(GetCurrentThreadId());
+    const std::uint64_t tick = static_cast<std::uint64_t>(GetTickCount64());
+    const std::uint64_t ctr = static_cast<std::uint64_t>(__rdtsc());
+
+    return splitmix64(
+        qpc.QuadPart ^
+        (pid << 32) ^
+        tid ^
+        (tick << 1) ^
+        ctr ^
+        static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(&g_cookie_ctr)
+        )
+    );
+#else
+    return 0;
+#endif
+}
+
+
+static inline std::uint64_t cookie_secret() noexcept {
+    static const std::uint64_t s = []() noexcept {
+        const std::uint64_t r = best_effort_entropy64();
         const std::uint64_t a = static_cast<std::uint64_t>(
             reinterpret_cast<std::uintptr_t>(&g_cookie_ctr)
         );
@@ -762,7 +780,7 @@ extern "C" int64_t __ark_launch(
     }
     
     // Bounds check for size (converting uint64 -> size_t safely)
-    if (args_size > static_cast<uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    if (args_size > static_cast<uint64_t>((std::numeric_limits<std::size_t>::max)())) {
         ark::rt::fatal("launch: args too large");
         return ARK_TASK_ERR_INVALID;
     }
