@@ -599,21 +599,43 @@ static void executePipeline(bool isRunMode, arklang::hud::Hud& hud) {
     if (performBuild) hud.note("Compiling " + displayName + " [" + shortKey + "]");
     else if (!opts.stageLinkOnly) hud.note("Cached    " + displayName + " [" + shortKey + "]");
 
-    const std::string validRuntime = resolveRuntimePath();
-    if (!llvm::sys::fs::exists(validRuntime)) {
-        hud.error(std::string("Runtime not found at: ") + validRuntime);
-        hud.finish(false);
-        std::exit(1);
-    }
-
     arklang::ModuleRegistry registry;
     ark::compiler::pipeline::Compiler compiler(hud, registry);
 
-    ark::compiler::pipeline::LinkerConfig linkCfg;
-    linkCfg.runtimePath = validRuntime;
+    ark::compiler::pipeline::LinkerConfig linkCfg{};
     linkCfg.llvmBinDir = opts.llvmBinDir;
     linkCfg.keepTmp = opts.keepTmp;
+    #if defined(_WIN32)
+    linkCfg.preferSharedRuntime = true;
+    #else
+    linkCfg.preferSharedRuntime = false;
+    #endif
+    linkCfg.devSourceRuntimeFallback = false;
+
+    if (!opts.runtimePath.empty() && opts.runtimePath != "tools/compiler/Runtime") {
+        linkCfg.toolchainRoot = opts.runtimePath;
+    } else {
+    #if defined(ARK_BUILD_DIR)
+        const std::string buildDir = ARK_BUILD_DIR;
+        const std::string toolOutDir = buildDir + "/tools/compiler";
+
+    #if defined(ARK_SOURCE_DIR)
+        const std::string sourceDir = ARK_SOURCE_DIR;
+        linkCfg.runtimeIncludeDirOverride = sourceDir + "/tools/compiler/Runtime";
+    #else
+        linkCfg.runtimeIncludeDirOverride = buildDir + "/include";
+    #endif
+
+        linkCfg.runtimeLibDirOverride = toolOutDir;
+        linkCfg.runtimeBinDirOverride = toolOutDir;
+        linkCfg.runtimeImportLibOverride = toolOutDir + "/ark_runtime.lib";
+        linkCfg.runtimeStaticLibOverride = toolOutDir + "/ark_runtime_static.lib";
+        linkCfg.runtimeSharedLibOverride = toolOutDir + "/ark_runtime.dll";
+    #endif
+    }
+
     ark::compiler::pipeline::Linker linker(hud, linkCfg);
+    const std::string jitRuntimePath = resolveRuntimePath();
 
     mlir::ModuleOp module;
     std::vector<ark::compiler::pipeline::CompiledGpuModule> gpuMods;
@@ -712,12 +734,20 @@ static void executePipeline(bool isRunMode, arklang::hud::Hud& hud) {
         ctx.loadAllAvailableDialects();
 
         if (!runStep(hud, {"Compiling", "Source → MIR"}, [&] {
-            return compiler.compileToMLIR(config.entryFile, ctx, module);
+            try {
+                return compiler.compileToMLIR(config.entryFile, ctx, module);
+            } catch (const std::exception& e) {
+                hud.error(std::string("GenMIR exception: ") + e.what());
+                return false;
+            } catch (...) {
+                hud.error("GenMIR threw a non-std exception during Source → MIR.");
+                return false;
+            }
         })) {
             hud.finish(false);
             std::exit(1);
         }
-
+        
         if (opts.stageCompile) {
             compiler.writeModuleToFile(module, opts.outputFile);
             hud.note("wrote MLIR: " + opts.outputFile);
@@ -757,7 +787,7 @@ static void executePipeline(bool isRunMode, arklang::hud::Hud& hud) {
 
         if (opts.jit) {
             arklang::hud::Step s(hud, {"JIT Execution", "Running in-memory"});
-            int rc = ark::compiler::pipeline::JIT::Run(module, validRuntime);
+            int rc = ark::compiler::pipeline::JIT::Run(module, jitRuntimePath);
             if (rc == 0) s.ok(); else s.fail();
             hud.finish(rc == 0);
             std::exit(rc);

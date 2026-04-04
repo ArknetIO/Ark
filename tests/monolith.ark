@@ -46,7 +46,6 @@ fn[host] main() -> i32 !IO {
             errors = errors + 1;
             
             if (errors > 5) {
-                print "... stopping verification (too many errors).";
                 return 1;
             }
         }

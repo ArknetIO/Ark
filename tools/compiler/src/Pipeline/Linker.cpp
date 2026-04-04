@@ -302,11 +302,13 @@ static void appendFatbinExportFlags(std::vector<std::string>& args, ToolchainKin
 static void appendPlatformLinkFlags(std::vector<std::string>& args, ToolchainKind toolchain) {
     if (toolchain == ToolchainKind::MSVC) {
         appendMsvcDefaultLib(args, "ws2_32.lib");
+        appendMsvcDefaultLib(args, "advapi32.lib");
         return;
     }
 
     if (toolchain == ToolchainKind::MinGW) {
         args.push_back("-lws2_32");
+        args.push_back("-ladvapi32");
         return;
     }
 
@@ -1046,6 +1048,10 @@ bool Linker::linkToBinary(
     }
 
     args = filterIrLinkFlags(args);
+
+    if (cfg_.toolchain == ToolchainKind::MSVC) {
+        args.push_back("-fms-runtime-lib=dll");
+    }
 
     if (needCxx) {
         args.push_back("-std=c++20");

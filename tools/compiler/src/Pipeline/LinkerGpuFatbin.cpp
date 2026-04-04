@@ -1,4 +1,4 @@
-// tools/compiler/Pipeline/LinkerGpuFatbin.cpp
+// tools/compiler/src/Pipeline/LinkerGpuFatbin.cpp
 #include "ark/compiler/Pipeline/Linker.hpp"
 #include "ark/compiler/Pipeline/Compiler.hpp"
 
@@ -13,6 +13,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace ark::compiler::pipeline {
@@ -24,14 +26,46 @@ static std::string sanitizeSymbol(std::string s) {
         const bool ok = (std::isalnum(uc) != 0) || (c == '_');
         if (!ok) c = '_';
     }
+
     if (s.empty()) s = "ark_gpu_blob";
     if (std::isdigit(static_cast<unsigned char>(s[0])) != 0) s.insert(s.begin(), '_');
     return s;
 }
 
+static std::uint64_t fnv1a64(std::string_view s) {
+    std::uint64_t h = 14695981039346656037ull;
+    for (unsigned char c : s) {
+        h ^= static_cast<std::uint64_t>(c);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static std::string hex64(std::uint64_t v) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i) {
+        out[i] = kHex[v & 0xF];
+        v >>= 4;
+    }
+    return out;
+}
+
+static bool isWindowsAmdGpuBlob(const LinkerConfig& cfg, std::string_view moduleKey) {
+    return cfg.toolchain == ToolchainKind::MSVC && moduleKey.ends_with(":amdgpu");
+}
+
+static std::string makeSymbolPrefix(const LinkerConfig& cfg, std::string_view moduleKey) {
+    if (isWindowsAmdGpuBlob(cfg, moduleKey)) {
+        return "ark_gpu_blob_amdgpu_" + hex64(fnv1a64(moduleKey));
+    }
+    return sanitizeSymbol("ark_gpu_blob_" + std::string(moduleKey));
+}
+
 static std::string cEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 16);
+
     for (unsigned char c : s) {
         if (c == '\\') out += "\\\\";
         else if (c == '"') out += "\\\"";
@@ -40,13 +74,18 @@ static std::string cEscape(const std::string& s) {
         else if (c == '\t') out += "\\t";
         else out.push_back(static_cast<char>(c));
     }
+
     return out;
 }
 
 static bool writeText(const std::string& path, const std::string& text, std::string& outErr) {
     std::error_code ec;
     llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
-    if (ec) { outErr = ec.message(); return false; }
+    if (ec) {
+        outErr = ec.message();
+        return false;
+    }
+
     os << text;
     os.close();
     return true;
@@ -55,15 +94,19 @@ static bool writeText(const std::string& path, const std::string& text, std::str
 static bool writeBytes(const std::string& path, llvm::StringRef bytes, std::string& outErr) {
     std::error_code ec;
     llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
-    if (ec) { outErr = ec.message(); return false; }
+    if (ec) {
+        outErr = ec.message();
+        return false;
+    }
+
     os.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     os.close();
     return true;
 }
 
 static std::string buildRegistryTU(const LinkerConfig& cfg,
-                                  const std::vector<CompiledGpuModule>& mods,
-                                  const std::vector<std::string>& symPrefixes) {
+                                   const std::vector<CompiledGpuModule>& mods,
+                                   const std::vector<std::string>& symPrefixes) {
     std::ostringstream o;
 
     o << "#include \"gpu/gpu_fatbin.h\"\n";
@@ -76,12 +119,10 @@ static std::string buildRegistryTU(const LinkerConfig& cfg,
     o << "  #define ARK_FATBIN_USED\n";
     o << "#endif\n\n";
 
-    // Blob symbol declarations emitted by createEmbeddingSource()
     for (std::size_t i = 0; i < mods.size(); ++i) {
         const std::string& p = symPrefixes[i];
 
         if (cfg.toolchain == ToolchainKind::MSVC) {
-            // MSVC embed emits: <p>_start[] and <p>_size
             o << "extern \"C\" const unsigned char " << p << "_start[];\n";
             o << "extern \"C\" const std::uint64_t " << p << "_size;\n";
         } else if (cfg.toolchain == ToolchainKind::Apple) {
@@ -92,17 +133,18 @@ static std::string buildRegistryTU(const LinkerConfig& cfg,
             o << "extern \"C\" const unsigned char " << p << "_end[];\n";
         }
     }
+
     if (!mods.empty()) o << "\n";
 
-    // Kernel name tables (nullable if kernel_count == 0)
     for (std::size_t i = 0; i < mods.size(); ++i) {
         o << "static const char* const kKernels_" << i << "[] = {\n";
-        for (const auto& k : mods[i].kernels) o << "  \"" << cEscape(k) << "\",\n";
+        for (const auto& k : mods[i].kernels) {
+            o << "  \"" << cEscape(k) << "\",\n";
+        }
         o << "  nullptr\n";
         o << "};\n\n";
     }
 
-    // Fatbin query function: exported C symbol
     o << "ARK_GPU_EXPORT ARK_FATBIN_USED const ark_gpu_fatbin_v1* ark_gpu_fatbin_query_v1() {\n";
     o << "  constexpr std::uint32_t kCount = " << static_cast<std::uint32_t>(mods.size()) << "u;\n";
     o << "  static ark_gpu_fatbin_entry_v1 entries[(kCount == 0u) ? 1u : kCount];\n";
@@ -163,7 +205,7 @@ std::optional<FatbinArtifacts> Linker::emitGpuFatbinArtifacts(const std::vector<
     symPrefixes.reserve(mods.size());
 
     for (const auto& mod : mods) {
-        const std::string symbol = sanitizeSymbol("ark_gpu_blob_" + mod.moduleKey);
+        const std::string symbol = makeSymbolPrefix(cfg_, mod.moduleKey);
         symPrefixes.push_back(symbol);
 
         llvm::SmallString<256> binPath(art.tmpDir);

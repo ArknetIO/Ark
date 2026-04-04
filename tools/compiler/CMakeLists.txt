@@ -1,13 +1,9 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 cmake_minimum_required(VERSION 3.20)
-# Inherit the root project() from the top-level CMakeLists.txt.
 
 include(GNUInstallDirs)
 include(FetchContent)
 
-# =========================================================
-# 1. Fetch CLI11 & tomlplusplus
-# =========================================================
 FetchContent_Declare(
   CLI11
   GIT_REPOSITORY https://github.com/CLIUtils/CLI11
@@ -23,9 +19,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(CLI11)
 FetchContent_MakeAvailable(tomlplusplus)
 
-# =========================================================
-# 2. Imported-target / LLVM artifact helpers
-# =========================================================
 function(ark_has_imported_artifact out_var target_name)
   set(_ok FALSE)
 
@@ -117,13 +110,6 @@ function(ark_llvm_lib_exists out_var lib_basename)
   set(${out_var} ${_ok} PARENT_SCOPE)
 endfunction()
 
-# =========================================================
-# 3. LLVM / MLIR surface
-# =========================================================
-
-# ---------------------------------------------------------
-# 3.a LLVM base surface
-# ---------------------------------------------------------
 set(LLVM_LINK_COMPONENTS
   Support
   Core
@@ -155,9 +141,6 @@ else()
   message(STATUS "[Ark][JIT] Host JIT disabled")
 endif()
 
-# ---------------------------------------------------------
-# 3.b GPU backend detection
-# ---------------------------------------------------------
 set(ARK_HAVE_LLVM_NVPTX_BACKEND OFF)
 if(ARK_ENABLE_NVPTX)
   list(FIND LLVM_TARGETS_TO_BUILD "NVPTX" _ark_has_nvptx_metadata)
@@ -195,9 +178,6 @@ endif()
 list(REMOVE_DUPLICATES LLVM_LINK_COMPONENTS)
 llvm_map_components_to_libnames(llvm_libs ${LLVM_LINK_COMPONENTS})
 
-# ---------------------------------------------------------
-# 3.c Required MLIR surface for compiler tools
-# ---------------------------------------------------------
 set(ARK_REQUIRED_MLIR_LIBS)
 
 foreach(_mlir_target
@@ -270,9 +250,6 @@ if(ARK_ENABLE_HOST_JIT)
   ark_require_imported_target(ARK_HOST_JIT_MLIR_LIBS MLIRExecutionEngine)
 endif()
 
-# =========================================================
-# 4. Runtime (Core + Platform Split)
-# =========================================================
 set(RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Runtime")
 
 set(RUNTIME_COMMON_SOURCES
@@ -319,17 +296,93 @@ set(RUNTIME_CORE_SOURCES
   ${RUNTIME_PLATFORM_SOURCES}
 )
 
-# =========================================================
-# 5. Config Header
-# =========================================================
+set(ARK_RUNTIME_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tools/compiler")
+
 configure_file(
   "${RUNTIME_DIR}/include/ark_config.h.in"
   "${CMAKE_BINARY_DIR}/include/ark_config.h"
 )
 
-# =========================================================
-# 6. GenMIR Reorganization
-# =========================================================
+add_custom_target(PrepareRuntimeHeaders ALL
+  COMMENT "Copying Protocol & ABI headers to Runtime/include..."
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/libs/ark-abi/include/
+    ${RUNTIME_DIR}/include/
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/libs/ark-wire/include/
+    ${RUNTIME_DIR}/include/
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/libs/ark-capsule/include/
+    ${RUNTIME_DIR}/include/
+)
+
+function(ark_configure_runtime_target target_name)
+  add_dependencies(${target_name} PrepareRuntimeHeaders)
+
+  target_include_directories(${target_name} PRIVATE
+    ${CMAKE_BINARY_DIR}/include
+    ${RUNTIME_DIR}/include
+    ${CMAKE_SOURCE_DIR}/libs/ark-abi/include
+    ${CMAKE_SOURCE_DIR}/libs/ark-wire/include
+    ${CMAKE_SOURCE_DIR}/libs/ark-capsule/include
+  )
+
+  target_link_libraries(${target_name} PRIVATE
+    ${ARK_PLATFORM_LINK_LIBS}
+    ${ARK_PLATFORM_DL_LIBS}
+  )
+
+  target_compile_features(${target_name} PRIVATE cxx_std_20)
+
+  if(WIN32)
+    target_compile_definitions(${target_name} PRIVATE
+      NOMINMAX
+      WIN32_LEAN_AND_MEAN
+      _CRT_SECURE_NO_DEPRECATE
+      _CRT_SECURE_NO_WARNINGS
+      _CRT_NONSTDC_NO_DEPRECATE
+      _CRT_NONSTDC_NO_WARNINGS
+      _SCL_SECURE_NO_DEPRECATE
+      _SCL_SECURE_NO_WARNINGS
+      UNICODE
+      _UNICODE
+      __STDC_CONSTANT_MACROS
+      __STDC_FORMAT_MACROS
+      __STDC_LIMIT_MACROS
+    )
+  endif()
+
+  set_target_properties(${target_name} PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${ARK_RUNTIME_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${ARK_RUNTIME_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${ARK_RUNTIME_OUTPUT_DIR}"
+    POSITION_INDEPENDENT_CODE ON
+  )
+endfunction()
+
+add_library(ark-runtime-static STATIC
+  ${RUNTIME_CORE_SOURCES}
+)
+set_target_properties(ark-runtime-static PROPERTIES
+  OUTPUT_NAME "ark_runtime_static"
+)
+
+add_library(ark-runtime-shared SHARED
+  ${RUNTIME_CORE_SOURCES}
+)
+set_target_properties(ark-runtime-shared PROPERTIES
+  OUTPUT_NAME "ark_runtime"
+)
+
+if(WIN32)
+  set_target_properties(ark-runtime-shared PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+  )
+endif()
+
+ark_configure_runtime_target(ark-runtime-static)
+ark_configure_runtime_target(ark-runtime-shared)
+
 set(ARK_GENMIR_SOURCES
   src/Frontend/GenMIR/GenMIR.Runtime.cpp
   src/Frontend/GenMIR/GenMIR.Types.cpp
@@ -340,9 +393,6 @@ set(ARK_GENMIR_SOURCES
   src/Frontend/GenMIR.cpp
 )
 
-# =========================================================
-# 7. Shared Compiler Sources
-# =========================================================
 set(ARK_COMPILER_SHARED_SOURCES
   src/Support/Hud.cpp
 
@@ -369,8 +419,6 @@ set(ARK_COMPILER_SHARED_SOURCES
   src/Frontend/RuntimeManager.cpp
   src/Frontend/ModuleRegistry.cpp
   src/Frontend/SymbolRegistry.cpp
-
-  ${RUNTIME_CORE_SOURCES}
 )
 
 if(ARK_ENABLE_HOST_JIT)
@@ -383,37 +431,7 @@ else()
   )
 endif()
 
-# =========================================================
-# 8. Common Source Policy Helpers
-# =========================================================
-function(ark_enable_exceptions_for_sources)
-  foreach(_src IN LISTS ARGN)
-    if(MSVC)
-      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "/EHsc")
-    else()
-      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "-fexceptions")
-    endif()
-  endforeach()
-endfunction()
-
-function(ark_enable_rtti_for_sources)
-  foreach(_src IN LISTS ARGN)
-    if(MSVC)
-      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "/GR")
-    else()
-      set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_OPTIONS "-frtti")
-    endif()
-  endforeach()
-endfunction()
-
-# =========================================================
-# 9. Common Target Configuration
-# =========================================================
-function(ark_fix_msvc_cpp_mode target_name)
-  if(NOT MSVC)
-    return()
-  endif()
-
+function(ark_strip_cpp_mode_flags target_name)
   get_target_property(_opts ${target_name} COMPILE_OPTIONS)
   if(NOT _opts)
     set(_opts "")
@@ -421,6 +439,10 @@ function(ark_fix_msvc_cpp_mode target_name)
 
   set(_clean_opts ${_opts})
   list(REMOVE_ITEM _clean_opts
+    -fno-exceptions
+    -fexceptions
+    -fno-rtti
+    -frtti
     /EHs
     /EHsc
     /EHc
@@ -435,7 +457,19 @@ function(ark_fix_msvc_cpp_mode target_name)
     set(_flags "")
   endif()
 
-  foreach(_flag /EHs /EHsc /EHc /EHs- /EHc- /GR /GR-)
+  foreach(_flag
+    -fno-exceptions
+    -fexceptions
+    -fno-rtti
+    -frtti
+    /EHs
+    /EHsc
+    /EHc
+    /EHs-
+    /EHc-
+    /GR
+    /GR-
+  )
     string(REPLACE "${_flag}" "" _flags "${_flags}")
   endforeach()
 
@@ -448,15 +482,22 @@ function(ark_fix_msvc_cpp_mode target_name)
   )
 endfunction()
 
+function(ark_enforce_cpp_mode target_name)
+  ark_strip_cpp_mode_flags(${target_name})
+
+  if(MSVC)
+    target_compile_options(${target_name} PRIVATE /EHsc /GR)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(${target_name} PRIVATE -fexceptions -frtti)
+  endif()
+endfunction()
+
 if(DEFINED LLVM_DIR AND NOT LLVM_DIR STREQUAL "")
   get_filename_component(ARK_DEFAULT_LLVM_BIN_DIR "${LLVM_DIR}/../../../bin" ABSOLUTE)
 else()
   set(ARK_DEFAULT_LLVM_BIN_DIR "")
 endif()
 
-# =========================================================
-# 10. Build Targets
-# =========================================================
 set(ARKNET_CLI_SOURCES
   src/CLI/Main.cpp
   src/CLI/Init.cpp
@@ -470,22 +511,10 @@ set(ARKNET_CLI_SOURCES
   src/CLI/Workspace.cpp
 )
 
-set(ARKNET_EXCEPTION_SOURCES
-  ${ARKNET_CLI_SOURCES}
-  ${ARK_GENMIR_SOURCES}
-)
-
-set(ARKNET_RTTI_SOURCES
-  ${ARK_GENMIR_SOURCES}
-)
-
 add_ark_tool(arknet
   ${ARKNET_CLI_SOURCES}
   ${ARK_COMPILER_SHARED_SOURCES}
 )
-
-ark_enable_exceptions_for_sources(${ARKNET_EXCEPTION_SOURCES})
-ark_enable_rtti_for_sources(${ARKNET_RTTI_SOURCES})
 
 foreach(TOOL_TARGET arknet)
 
@@ -494,6 +523,8 @@ foreach(TOOL_TARGET arknet)
     ArkMirOpsIncGen
     ArkMirTypesIncGen
     PrepareRuntimeHeaders
+    ark-runtime-static
+    ark-runtime-shared
   )
 
   target_include_directories(${TOOL_TARGET} PRIVATE
@@ -513,6 +544,7 @@ foreach(TOOL_TARGET arknet)
     ark-abi
     ark-wire
     Ark::Crypto
+    ark-runtime-static
 
     ArkMirDialect
     ArkToLLVM
@@ -564,6 +596,8 @@ foreach(TOOL_TARGET arknet)
 
   target_compile_definitions(${TOOL_TARGET} PRIVATE
     ARK_RUNTIME_SOURCE_DIR="${RUNTIME_DIR}"
+    ARK_BUILD_DIR="${CMAKE_BINARY_DIR}"
+    ARK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   )
 
   if(UNIX AND NOT APPLE)
@@ -574,7 +608,10 @@ foreach(TOOL_TARGET arknet)
 
   set_target_properties(${TOOL_TARGET} PROPERTIES ENABLE_EXPORTS 1)
 
-  ark_fix_msvc_cpp_mode(${TOOL_TARGET})
+  ark_enforce_cpp_mode(${TOOL_TARGET})
+
+  get_target_property(_ark_tool_opts ${TOOL_TARGET} COMPILE_OPTIONS)
+  message(STATUS "[Ark][${TOOL_TARGET}] COMPILE_OPTIONS=${_ark_tool_opts}")
 
 endforeach()
 
@@ -583,9 +620,6 @@ target_link_libraries(arknet PRIVATE
   tomlplusplus::tomlplusplus
 )
 
-# =========================================================
-# 11. Build the Capsule Stub (ark-stub)
-# =========================================================
 add_executable(ark-stub src/Runner/Stub.cpp)
 target_compile_definitions(ark-stub PRIVATE ARK_STUB_STANDALONE)
 
@@ -625,28 +659,27 @@ else()
   endif()
 endif()
 
-# =========================================================
-# 12. Installation
-# =========================================================
-install(TARGETS arknet ark-stub DESTINATION bin)
-
-# =========================================================
-# 13. Runtime Headers Preparation
-# =========================================================
-add_custom_target(PrepareRuntimeHeaders ALL
-  COMMENT "Copying Protocol & ABI headers to Runtime/include..."
-  COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/libs/ark-abi/include/
-    ${RUNTIME_DIR}/include/
-  COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/libs/ark-wire/include/
-    ${RUNTIME_DIR}/include/
-  COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/libs/ark-capsule/include/
-    ${RUNTIME_DIR}/include/
+install(TARGETS
+  arknet
+  ark-stub
+  ark-runtime-static
+  ark-runtime-shared
+  RUNTIME DESTINATION bin
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
 )
 
-# =========================================================
-# 14. GPU Plugins (SHARED)
-# =========================================================
+install(DIRECTORY
+  ${CMAKE_SOURCE_DIR}/libs/ark-abi/include/
+  ${CMAKE_SOURCE_DIR}/libs/ark-wire/include/
+  ${CMAKE_SOURCE_DIR}/libs/ark-capsule/include/
+  ${RUNTIME_DIR}/include/
+  DESTINATION include
+)
+
+install(FILES
+  ${CMAKE_BINARY_DIR}/include/ark_config.h
+  DESTINATION include
+)
+
 add_subdirectory(Runtime/gpu)

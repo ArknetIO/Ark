@@ -734,6 +734,18 @@ bool Compiler::compileToMLIR(llvm::StringRef inputFilename,
                              mlir::ModuleOp& outModule) {
     prepareCompilerContext(ctx);
 
+    ctx.getOrLoadDialect<arklang::mir::ArkMirDialect>();
+    ctx.getOrLoadDialect<mlir::func::FuncDialect>();
+    ctx.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx.getOrLoadDialect<mlir::vector::VectorDialect>();
+    ctx.getOrLoadDialect<mlir::index::IndexDialect>();
+    ctx.getOrLoadDialect<mlir::gpu::GPUDialect>();
+    ctx.getOrLoadDialect<mlir::ub::UBDialect>();
+
     auto modOr = registry_.load(inputFilename.str(), "");
     if (!modOr) {
         hud_.error(llvm::toString(modOr.takeError()));
@@ -750,21 +762,15 @@ bool Compiler::compileToMLIR(llvm::StringRef inputFilename,
     std::vector<arklang::Module*> allModules;
     collectDependencies(*modOr, visited, allModules);
 
-    for (auto* m : allModules) {
-        genMir.registerModule(*m, (m == *modOr));
-    }
-
+    for (auto* m : allModules) genMir.registerModule(*m, (m == *modOr));
     for (auto* m : allModules) {
         genMir.clearImports();
-        for (const auto& imp : m->imports) {
-            if (m->submodules.count(imp->alias)) {
+        for (const auto& imp : m->imports)
+            if (m->submodules.count(imp->alias))
                 genMir.registerImport(imp->alias, m->submodules[imp->alias]);
-            }
-        }
 
-        if (mlir::failed(genMir.compileModule(*m, (m == *modOr)))) {
+        if (mlir::failed(genMir.compileModule(*m, (m == *modOr))))
             return false;
-        }
     }
 
     mlir::PassManager pm(&ctx);
@@ -775,6 +781,7 @@ bool Compiler::compileToMLIR(llvm::StringRef inputFilename,
 
     return mlir::succeeded(pm.run(outModule)) && mlir::succeeded(mlir::verify(outModule));
 }
+
 
 bool Compiler::lowerToLLVM(mlir::MLIRContext& ctx, mlir::ModuleOp module) {
     prepareCompilerContext(ctx);

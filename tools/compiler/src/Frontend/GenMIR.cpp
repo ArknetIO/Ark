@@ -1477,24 +1477,16 @@ mlir::FailureOr<RValue> GenMIR::lowerLiteral(const LiteralExpr &lit) {
 mlir::FailureOr<RValue> GenMIR::lowerBinary(const BinaryExpr &bin) {
     mlir::Location loc = toLoc(bin.loc);
 
-    // 1. Lower Operands (RValues)
     auto lhsRes = lowerExpr(*bin.lhs);
     auto rhsRes = lowerExpr(*bin.rhs);
     if (failed(lhsRes) || failed(rhsRes)) return failure();
 
     mlir::Value lhs = lhsRes->val;
     mlir::Value rhs = rhsRes->val;
-    mlir::Value state = rhsRes->state; 
+    mlir::Value state = rhsRes->state;
 
-    // 2. Resolve AST Types (Source of Truth)
     arklang::Type lTy = getExprType(*bin.lhs);
     arklang::Type rTy = getExprType(*bin.rhs);
-
-    // 3. Type Unification & Coercion
-    //    Prioritize Float > Int64 > Int32
-    mlir::Type targetTy;
-    bool isFloat = false;
-    bool isSigned = true;
 
     auto isUnsignedAstInt = [](const arklang::Type& t) -> bool {
         switch (t.kind) {
@@ -1520,84 +1512,56 @@ mlir::FailureOr<RValue> GenMIR::lowerBinary(const BinaryExpr &bin) {
         }
     };
 
-    // [FIX] Check both AST type AND actual MLIR Type for safety.
-    bool isLhsFloat = (lTy.kind == arklang::Type::F64 || lTy.kind == arklang::Type::F32 ||
-                       llvm::isa<mlir::FloatType>(lhs.getType()));
-    bool isRhsFloat = (rTy.kind == arklang::Type::F64 || rTy.kind == arklang::Type::F32 ||
-                       llvm::isa<mlir::FloatType>(rhs.getType()));
+    auto isFloatLike = [](mlir::Type t) -> bool {
+        return llvm::isa<mlir::FloatType>(t);
+    };
 
-    if (isLhsFloat || isRhsFloat) {
-        isFloat = true;
-        // Check if either is a 64-bit float
-        bool is64 = (lTy.kind == arklang::Type::F64 || rTy.kind == arklang::Type::F64 || 
-                     lhs.getType().isF64() || rhs.getType().isF64());
-        if (is64) {
-            targetTy = builder.getF64Type();
-        } else {
-            targetTy = builder.getF32Type();
-        }
-    } else if (lTy.kind == arklang::Type::I64 || rTy.kind == arklang::Type::I64 ||
-               lhs.getType().isInteger(64) || rhs.getType().isInteger(64)) {
-        targetTy = builder.getI64Type();
-    } else {
-        targetTy = builder.getI32Type(); // Default Int promotion
-    }
-    if (!isFloat) {
-        // If either side is explicitly signed, keep signed arithmetic.
-        // Else if either side is explicitly unsigned, use unsigned arithmetic.
-        if (isSignedAstInt(lTy) || isSignedAstInt(rTy)) {
-            isSigned = true;
-        } else if (isUnsignedAstInt(lTy) || isUnsignedAstInt(rTy)) {
-            isSigned = false;
-        } else {
-            isSigned = true; // default for inferred ints
-        }
-    }
-    // --- Special Case: Strings ---
     if (lTy.kind == arklang::Type::Str || rTy.kind == arklang::Type::Str) {
-        // ABI: Strings are { i8*, intptr }
         mlir::Type strTy = convertType(arklang::Type{arklang::Type::Str});
-        
+
         if (bin.op == "+") {
-             if (!module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("__ark_str_concat")) {
-                 mlir::OpBuilder::InsertionGuard g(builder);
-                 builder.setInsertionPointToStart(module.getBody());
-                 auto fnTy = mlir::LLVM::LLVMFunctionType::get(strTy, {strTy, strTy}, false);
-                 builder.create<mlir::LLVM::LLVMFuncOp>(builder.getUnknownLoc(), "__ark_str_concat", fnTy);
-             }
-             auto fn = mlir::SymbolRefAttr::get(builder.getContext(), "__ark_str_concat");
-             auto call = builder.create<mlir::LLVM::CallOp>(
-                 loc, strTy, fn, mlir::ValueRange{lhs, rhs});
-             
-             return RValue{call.getOperation()->getResult(0), state};
+            if (!module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("__ark_str_concat")) {
+                mlir::OpBuilder::InsertionGuard g(builder);
+                builder.setInsertionPointToStart(module.getBody());
+                auto fnTy = mlir::LLVM::LLVMFunctionType::get(strTy, {strTy, strTy}, false);
+                builder.create<mlir::LLVM::LLVMFuncOp>(builder.getUnknownLoc(), "__ark_str_concat", fnTy);
+            }
+
+            auto fn = mlir::SymbolRefAttr::get(builder.getContext(), "__ark_str_concat");
+            auto call = builder.create<mlir::LLVM::CallOp>(loc, strTy, fn, mlir::ValueRange{lhs, rhs});
+            return RValue{call.getOperation()->getResult(0), state};
         }
-        else if (bin.op == "==" || bin.op == "!=") {
-             if (!module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("__ark_str_eq")) {
-                 mlir::OpBuilder::InsertionGuard g(builder);
-                 builder.setInsertionPointToStart(module.getBody());
-                 auto fnTy = mlir::LLVM::LLVMFunctionType::get(builder.getI1Type(), {strTy, strTy}, false);
-                 builder.create<mlir::LLVM::LLVMFuncOp>(builder.getUnknownLoc(), "__ark_str_eq", fnTy);
-             }
-             auto fn = mlir::SymbolRefAttr::get(builder.getContext(), "__ark_str_eq");
-             auto call = builder.create<mlir::LLVM::CallOp>(
-                 loc, builder.getI1Type(), fn, mlir::ValueRange{lhs, rhs});
-             
-             mlir::Value res = call.getOperation()->getResult(0);
-             if (bin.op == "!=") {
-                 mlir::Value trueVal = builder.create<mlir::LLVM::ConstantOp>(
-                     loc, builder.getI1Type(), builder.getIntegerAttr(builder.getI1Type(), 1));
-                 res = builder.create<mlir::LLVM::XOrOp>(loc, res, trueVal);
-             }
-             return RValue{res, state};
+
+        if (bin.op == "==" || bin.op == "!=") {
+            if (!module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("__ark_str_eq")) {
+                mlir::OpBuilder::InsertionGuard g(builder);
+                builder.setInsertionPointToStart(module.getBody());
+                auto fnTy = mlir::LLVM::LLVMFunctionType::get(builder.getI1Type(), {strTy, strTy}, false);
+                builder.create<mlir::LLVM::LLVMFuncOp>(builder.getUnknownLoc(), "__ark_str_eq", fnTy);
+            }
+
+            auto fn = mlir::SymbolRefAttr::get(builder.getContext(), "__ark_str_eq");
+            auto call = builder.create<mlir::LLVM::CallOp>(loc, builder.getI1Type(), fn, mlir::ValueRange{lhs, rhs});
+
+            mlir::Value res = call.getOperation()->getResult(0);
+            if (bin.op == "!=") {
+                mlir::Value trueVal = builder.create<mlir::LLVM::ConstantOp>(
+                    loc,
+                    builder.getI1Type(),
+                    builder.getIntegerAttr(builder.getI1Type(), 1)
+                );
+                res = builder.create<mlir::LLVM::XOrOp>(loc, res, trueVal);
+            }
+
+            return RValue{res, state};
         }
+
         return fail(bin.loc, "Unsupported string operator: " + bin.op);
     }
 
-    // --- Special Case: Enums ---
     bool isEnum = false;
-    if ((lTy.kind == arklang::Type::Schema || lTy.kind == arklang::Type::Generic) && 
+    if ((lTy.kind == arklang::Type::Schema || lTy.kind == arklang::Type::Generic) &&
         (lTy.schemaName == rTy.schemaName)) {
-        
         const SchemaDecl *decl = resolveSchemaAST(lTy.schemaName);
         if (decl && decl->kind == SchemaDecl::Enum) {
             isEnum = true;
@@ -1606,41 +1570,96 @@ mlir::FailureOr<RValue> GenMIR::lowerBinary(const BinaryExpr &bin) {
 
     if (isEnum && (bin.op == "==" || bin.op == "!=")) {
         mlir::Value lTag = builder.create<mlir::LLVM::ExtractValueOp>(
-            loc, lhs, builder.getDenseI64ArrayAttr({0})).getResult();
+            loc, lhs, builder.getDenseI64ArrayAttr({0})
+        ).getResult();
+
         mlir::Value rTag = builder.create<mlir::LLVM::ExtractValueOp>(
-            loc, rhs, builder.getDenseI64ArrayAttr({0})).getResult();
-            
-        auto pred = (bin.op == "==") ? mlir::LLVM::ICmpPredicate::eq : mlir::LLVM::ICmpPredicate::ne;
+            loc, rhs, builder.getDenseI64ArrayAttr({0})
+        ).getResult();
+
+        auto pred = (bin.op == "==")
+            ? mlir::LLVM::ICmpPredicate::eq
+            : mlir::LLVM::ICmpPredicate::ne;
+
         mlir::Value res = builder.create<mlir::LLVM::ICmpOp>(loc, pred, lTag, rTag);
         return RValue{res, state};
     }
 
-    // Apply Standard Coercion
+    mlir::Type targetTy;
+    bool isSigned = true;
+
+    const bool lhsFloat =
+        lTy.kind == arklang::Type::F32 ||
+        lTy.kind == arklang::Type::F64 ||
+        isFloatLike(lhs.getType());
+
+    const bool rhsFloat =
+        rTy.kind == arklang::Type::F32 ||
+        rTy.kind == arklang::Type::F64 ||
+        isFloatLike(rhs.getType());
+
+    if (lhsFloat || rhsFloat) {
+        const bool wantF64 =
+            lTy.kind == arklang::Type::F64 ||
+            rTy.kind == arklang::Type::F64 ||
+            lhs.getType().isF64() ||
+            rhs.getType().isF64();
+
+        targetTy = wantF64 ? builder.getF64Type() : builder.getF32Type();
+    } else if (lTy.kind == arklang::Type::I64 || rTy.kind == arklang::Type::I64 ||
+               lhs.getType().isInteger(64) || rhs.getType().isInteger(64)) {
+        targetTy = builder.getI64Type();
+    } else {
+        targetTy = builder.getI32Type();
+    }
+
+    if (isSignedAstInt(lTy) || isSignedAstInt(rTy)) {
+        isSigned = true;
+    } else if (isUnsignedAstInt(lTy) || isUnsignedAstInt(rTy)) {
+        isSigned = false;
+    } else {
+        isSigned = true;
+    }
+
     lhs = coerce(builder, loc, lhs, targetTy);
     rhs = coerce(builder, loc, rhs, targetTy);
 
+    const bool useFloatOps = isFloatLike(lhs.getType()) || isFloatLike(rhs.getType());
+
     mlir::Value result;
 
-    // 4. Generate LLVM Operations
     if (bin.op == "+") {
-        if (isFloat) result = builder.create<mlir::LLVM::FAddOp>(loc, lhs, rhs);
-        else result = builder.create<mlir::LLVM::AddOp>(loc, lhs, rhs);
+        if (useFloatOps) {
+            result = builder.create<mlir::LLVM::FAddOp>(loc, lhs, rhs);
+        } else {
+            result = builder.create<mlir::LLVM::AddOp>(loc, lhs, rhs);
+        }
     }
     else if (bin.op == "-") {
-        if (isFloat) result = builder.create<mlir::LLVM::FSubOp>(loc, lhs, rhs);
-        else result = builder.create<mlir::LLVM::SubOp>(loc, lhs, rhs);
+        if (useFloatOps) {
+            result = builder.create<mlir::LLVM::FSubOp>(loc, lhs, rhs);
+        } else {
+            result = builder.create<mlir::LLVM::SubOp>(loc, lhs, rhs);
+        }
     }
     else if (bin.op == "*") {
-        if (isFloat) result = builder.create<mlir::LLVM::FMulOp>(loc, lhs, rhs);
-        else result = builder.create<mlir::LLVM::MulOp>(loc, lhs, rhs);
+        if (useFloatOps) {
+            result = builder.create<mlir::LLVM::FMulOp>(loc, lhs, rhs);
+        } else {
+            result = builder.create<mlir::LLVM::MulOp>(loc, lhs, rhs);
+        }
     }
     else if (bin.op == "/") {
-        if (isFloat) result = builder.create<mlir::LLVM::FDivOp>(loc, lhs, rhs);
-        else if (isSigned) result = builder.create<mlir::LLVM::SDivOp>(loc, lhs, rhs);
-        else result = builder.create<mlir::LLVM::UDivOp>(loc, lhs, rhs);
+        if (useFloatOps) {
+            result = builder.create<mlir::LLVM::FDivOp>(loc, lhs, rhs);
+        } else if (isSigned) {
+            result = builder.create<mlir::LLVM::SDivOp>(loc, lhs, rhs);
+        } else {
+            result = builder.create<mlir::LLVM::UDivOp>(loc, lhs, rhs);
+        }
     }
     else if (bin.op == "%") {
-        if (isFloat) {
+        if (useFloatOps) {
             return fail(bin.loc, "Modulo '%' is only supported for integer types");
         } else if (isSigned) {
             result = builder.create<mlir::LLVM::SRemOp>(loc, lhs, rhs);
@@ -1648,33 +1667,35 @@ mlir::FailureOr<RValue> GenMIR::lowerBinary(const BinaryExpr &bin) {
             result = builder.create<mlir::LLVM::URemOp>(loc, lhs, rhs);
         }
     }
-    // Comparisons
     else if (bin.op == "==" || bin.op == "!=") {
-        if (isFloat) {
-            auto pred = (bin.op == "==") ? mlir::LLVM::FCmpPredicate::oeq : mlir::LLVM::FCmpPredicate::une;
+        if (useFloatOps) {
+            auto pred = (bin.op == "==")
+                ? mlir::LLVM::FCmpPredicate::oeq
+                : mlir::LLVM::FCmpPredicate::une;
             result = builder.create<mlir::LLVM::FCmpOp>(loc, pred, lhs, rhs);
         } else {
-            auto pred = (bin.op == "==") ? mlir::LLVM::ICmpPredicate::eq : mlir::LLVM::ICmpPredicate::ne;
+            auto pred = (bin.op == "==")
+                ? mlir::LLVM::ICmpPredicate::eq
+                : mlir::LLVM::ICmpPredicate::ne;
             result = builder.create<mlir::LLVM::ICmpOp>(loc, pred, lhs, rhs);
         }
     }
     else if (bin.op == "<" || bin.op == "<=" || bin.op == ">" || bin.op == ">=") {
-        if (isFloat) {
+        if (useFloatOps) {
             mlir::LLVM::FCmpPredicate pred;
             if (bin.op == "<") pred = mlir::LLVM::FCmpPredicate::olt;
             else if (bin.op == "<=") pred = mlir::LLVM::FCmpPredicate::ole;
             else if (bin.op == ">") pred = mlir::LLVM::FCmpPredicate::ogt;
             else pred = mlir::LLVM::FCmpPredicate::oge;
-            
+
             result = builder.create<mlir::LLVM::FCmpOp>(loc, pred, lhs, rhs);
         } else {
             mlir::LLVM::ICmpPredicate pred;
-            // Assuming Signed Integers for general logic.
             if (bin.op == "<") pred = isSigned ? mlir::LLVM::ICmpPredicate::slt : mlir::LLVM::ICmpPredicate::ult;
             else if (bin.op == "<=") pred = isSigned ? mlir::LLVM::ICmpPredicate::sle : mlir::LLVM::ICmpPredicate::ule;
             else if (bin.op == ">") pred = isSigned ? mlir::LLVM::ICmpPredicate::sgt : mlir::LLVM::ICmpPredicate::ugt;
             else pred = isSigned ? mlir::LLVM::ICmpPredicate::sge : mlir::LLVM::ICmpPredicate::uge;
-            
+
             result = builder.create<mlir::LLVM::ICmpOp>(loc, pred, lhs, rhs);
         }
     }
